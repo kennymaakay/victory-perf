@@ -18,6 +18,9 @@ pub mod resource;
 pub mod spill;
 pub mod structure;
 
+// `SOURCE_HASH`: what identifies this translator for a cache of its output.
+include!(concat!(env!("OUT_DIR"), "/source_hash.rs"));
+
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
