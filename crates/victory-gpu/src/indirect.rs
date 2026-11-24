@@ -659,6 +659,13 @@ void main() {
     /// ahead with the relay, whose pieces are fetched flight by flight) it
     /// stores the hash it made: each compare flags what changed since the
     /// compare before it, also a change back.
+    ///
+    /// A piece is hashed by a group of 64 threads, each taking 16 bytes of
+    /// every kilobyte: a change is found in the blocks of the first thread
+    /// and of the last, at both ends of the piece, in a short piece at
+    /// either end of a copy that does not start at a piece, in the 4,097th
+    /// block a piece then spans, and where two blocks of a piece only swap
+    /// places, in one thread's blocks or in two threads'.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
         let Some(mut warp) = WarpHarness::new() else {
@@ -666,58 +673,109 @@ void main() {
         };
         let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
-        const PIECES: u32 = 3;
-        let size = PIECE * PIECES as usize;
+        let size = 3 * PIECE;
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
-        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * 4);
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
-        // One pass over the three pieces; what it left in `differs` (7s
-        // where it stored nothing).
-        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+        // One pass over the copy's pieces, three, or four when the copy
+        // starts `skew` bytes into its piece 0; what it left in `differs`
+        // (7s where it stored nothing).
+        let run = |warp: &mut WarpHarness, skew: u32, mode: u32| -> [u32; 4] {
+            let pieces = if skew == 0 { 3 } else { 4 };
             // SAFETY: our open list, live buffers, the compare's own root
             // signature; the mappings hold what is read and written.
             unsafe {
-                for piece in 0..PIECES as usize {
+                for piece in 0..4 {
                     differs_ptr.cast::<u32>().add(piece).write_volatile(7);
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                crate::host::card_compare_dispatch(&warp.list, 0, skew, size as u32, pieces, 0, mode);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
-            [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+            [0, 1, 2, 3].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        // SAFETY (each): inside the mapping.
+        let set = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+        let swap = |a: usize, b: usize| {
+            // SAFETY: two blocks of 16 bytes inside the mapping, apart.
+            unsafe { std::ptr::swap_nonoverlapping(now_ptr.add(a), now_ptr.add(b), 16) };
         };
         let at = PIECE + 1234;
-        // SAFETY (each): inside the mapping.
-        let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
-        assert_eq!(run(&mut warp, 0), [7, 7, 7]);
-        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        assert_eq!(run(&mut warp, 0, 0), [7, 7, 7, 7]);
+        assert_eq!(run(&mut warp, 0, 1), [0, 0, 0, 7]);
         // A change in the second piece: flagged, and with 1 flagged again
         // (the hash stays the old one).
-        set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
+        set(at, content[at] ^ 0x40);
+        assert_eq!(run(&mut warp, 0, 1), [0, 1, 0, 7]);
+        assert_eq!(run(&mut warp, 0, 1), [0, 1, 0, 7]);
         // Changed back: with 1 the piece looks untouched.
-        set(content[at]);
-        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        set(at, content[at]);
+        assert_eq!(run(&mut warp, 0, 1), [0, 0, 0, 7]);
         // With 2 the change is flagged once, and the hash is the new one.
-        set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        set(at, content[at] ^ 0x40);
+        assert_eq!(run(&mut warp, 0, 2), [0, 1, 0, 7]);
+        assert_eq!(run(&mut warp, 0, 2), [0, 0, 0, 7]);
         // Changed back: flagged, where 1 saw nothing.
-        set(content[at]);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        set(at, content[at]);
+        assert_eq!(run(&mut warp, 0, 2), [0, 1, 0, 7]);
+        assert_eq!(run(&mut warp, 0, 2), [0, 0, 0, 7]);
+
+        // The pieces a change of the byte at `at` is flagged in, with 2:
+        // once for the change and once for the change back.
+        let flags = |warp: &mut WarpHarness, skew: u32, at: usize| -> [u32; 4] {
+            let quiet = if skew == 0 { [0, 0, 0, 7] } else { [0; 4] };
+            set(at, content[at] ^ 0x40);
+            let changed = run(warp, skew, 2);
+            assert_eq!(run(warp, skew, 2), quiet, "{skew} {at:#x}");
+            set(at, content[at]);
+            assert_eq!(run(warp, skew, 2), changed, "{skew} {at:#x} changed back");
+            assert_eq!(run(warp, skew, 2), quiet, "{skew} {at:#x}");
+            changed
+        };
+        // Pieces cut at 64 KiB: block i of a piece is thread i % 64's.
+        // The first thread's first and last blocks, the last thread's
+        // first and last (the piece's last byte), the copy's ends.
+        assert_eq!(flags(&mut warp, 0, PIECE), [0, 1, 0, 7]);
+        assert_eq!(flags(&mut warp, 0, PIECE + 63 * 1024 + 15), [0, 1, 0, 7]);
+        assert_eq!(flags(&mut warp, 0, PIECE + 63 * 16), [0, 1, 0, 7]);
+        assert_eq!(flags(&mut warp, 0, 2 * PIECE - 1), [0, 1, 0, 7]);
+        assert_eq!(flags(&mut warp, 0, 0), [1, 0, 0, 7]);
+        assert_eq!(flags(&mut warp, 0, size - 1), [0, 0, 1, 7]);
+        // Two blocks swapped: in the first thread's blocks, in two threads'
+        // that lie side by side, in the first thread's and the last's, in
+        // the last thread's at the piece's end.
+        for (a, b) in [(0, 64), (5, 6), (0, 63), (4095, 4031)] {
+            let (a, b) = (PIECE + a * 16, PIECE + b * 16);
+            assert_ne!(content[a..a + 16], content[b..b + 16], "blocks {a:#x} {b:#x} must differ");
+            swap(a, b);
+            assert_eq!(run(&mut warp, 0, 2), [0, 1, 0, 7], "blocks {a:#x} {b:#x} swapped");
+            assert_eq!(run(&mut warp, 0, 2), [0, 0, 0, 7]);
+            swap(a, b);
+            assert_eq!(run(&mut warp, 0, 2), [0, 1, 0, 7], "blocks {a:#x} {b:#x} swapped back");
+            assert_eq!(run(&mut warp, 0, 2), [0, 0, 0, 7]);
+        }
+
+        // A copy that starts 8 bytes into its piece 0: piece 0 holds its
+        // bytes [0, 65528), piece 3 the last 8. Widened to 16 bytes, a piece
+        // between spans 4,097 blocks, the last one its first thread's 65th,
+        // and the blocks at its ends are also those of the pieces beside it.
+        let skew = 8;
+        assert_eq!(run(&mut warp, skew, 0), [7, 7, 7, 7]);
+        assert_eq!(run(&mut warp, skew, 2), [0, 0, 0, 0]);
+        assert_eq!(flags(&mut warp, skew, 10), [1, 0, 0, 0]);
+        assert_eq!(flags(&mut warp, skew, PIECE - 6), [1, 1, 0, 0]);
+        assert_eq!(flags(&mut warp, skew, PIECE - 16 + 63 * 16 + 2), [0, 1, 0, 0]);
+        assert_eq!(flags(&mut warp, skew, 2 * PIECE - 14), [0, 1, 1, 0]);
+        assert_eq!(flags(&mut warp, skew, size - 3), [0, 0, 1, 1]);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.

@@ -140,18 +140,31 @@ pub(crate) fn cards() -> bool {
 }
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
-/// most bytes of such copies (their "before" twins not counted: a copy
-/// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// most bytes of such copies (the hashes of their pieces not counted, 16
+/// bytes a 64 KiB piece), both in bytes:
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (768).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
+///
+/// The defaults were 16 and 512. Buffers of 1 to 16 MiB left on the PC's
+/// side are what the CPU still compares after the card ([`back_line`]
+/// counts them), so they go to the card too; the faster runs used 1 and
+/// 1024. With 1 the small buffers compete for the cap with the big ones,
+/// which are made in no fixed order, so the cap is raised past 512, and
+/// 768 rather than 1024 for cards of 8 GB: copies are 274 MB over run 69's
+/// at most, which leaves about 1.4 GB of those 1,650 MB free where 1024
+/// would leave about 1.1 (with the twins copies had before the hashes,
+/// 1.1 and 0.6). The rule in
+/// [`card_for`] (a fifth of the budget free when a copy is made) still
+/// holds for each copy; a copy that does not fit stays on the PC's side,
+/// as any copy did before.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 768))
     })
 }
 
@@ -454,8 +467,9 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
-/// [`keeps`]). `crate::host::relay` says what it does; here it changes
+/// (`VICTORY_RELAY=1` or `2`; off by default, unlike the late wait it
+/// rides on, for the reason `crate::host::relay` gives; not with kept
+/// snapshots, [`keeps`]). `crate::host::relay` says what it does; here it changes
 /// what a copy keeps:
 ///
 /// - the ranges shaders may be writing are counted per submission
@@ -937,7 +951,8 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
 /// compare that finds what the shaders wrote, run on several threads
-/// across ranges (`VICTORY_WIDE_BACK=1`; off by default).
+/// across ranges (on by default since the faster runs used it;
+/// `VICTORY_WIDE_BACK=0` does both range by range, as before).
 ///
 /// Both ran range by range on the submitting thread, a range on several
 /// threads only if it was 16 MiB or more. The ranges left on the CPU's side
@@ -958,7 +973,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// lists only afterwards).
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -1221,7 +1236,7 @@ pub(crate) fn back_line(frames: f64) {
     tracing::info!(
         "shader writes looked for on the CPU per frame: {:.1} MB compared in {:.0} ranges of windows outside buffers ({:.1} MB \
          snapshotted), {:.1} MB in {:.0} ranges of title buffers' copies ({:.1} MB snapshotted), of them {:.1} MB in copies \
-         of 1 MiB or more (VICTORY_CARD_BUFFERS_MIN_MB=1 would have the card look there)",
+         of 1 MiB or more (left on the PC's side by VICTORY_CARD_BUFFERS_MIN_MB, VICTORY_CARD_BUFFERS_MB or a full card)",
         mb(c[2]),
         c[5],
         mb(c[0]),
@@ -2581,8 +2596,9 @@ impl Shadow {
     }
 
     /// [`relay`], for a copy in the card's memory: `gpu` is what the
-    /// card's side held at offset `at` on when a fetch sent after send
-    /// `fetched_after` (`crate::host`'s order of the queue) ran, in a piece
+    /// card's side held at offset `at` on when a fetch ran that sends up
+    /// to `fetched_after` (`crate::host`'s order of the queue) had surely
+    /// reached, and later ones perhaps (a fetch on the copy queue), in a piece
     /// the compare found differing. The bytes that differ from the CPU's
     /// side are what shaders wrote; they go into title memory, from the
     /// first to the last of them, and into the CPU's side. Nothing is sent

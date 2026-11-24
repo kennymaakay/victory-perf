@@ -2619,8 +2619,12 @@ mod tests {
         let host_image = host_resource(image).unwrap();
         let back = host.new_list().unwrap();
         let (_, before) = host_transition(image, 0x800).unwrap();
-        // The upload list holds the texture until it is reset.
-        assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
+        // The upload list holds the texture until it is reset. Sent ahead
+        // (`crate::host::late`, the default) the list is reset when its
+        // flight has landed, which on a fast card may be done already.
+        if !crate::host::late() {
+            assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
+        }
         use windows::core::Interface;
         let out_to = Location {
             resource: readback.as_raw().cast_const().cast(),

@@ -76,9 +76,11 @@ pub(crate) fn probe_level() -> u8 {
 ///
 /// What it assumes, for 2: nothing reads title memory that a submission
 /// not yet run writes through such a buffer. With every submission waited
-/// for (the default) that holds; with `VICTORY_LATE_WAIT` it does not,
+/// for that holds; with the late wait (`crate::host::late`) it does not,
 /// since the flights' rules know shader writes only by the ranges copies
-/// declare. Do not combine 2 with late wait.
+/// declare. Do not combine 2 with late wait: the late wait is on by
+/// default and gives way to 2 unless `VICTORY_LATE_WAIT` or
+/// `VICTORY_RELAY` asks for it.
 ///
 /// shortcut: while a window is in place the title cannot decommit, free
 /// or protect its pages (the call fails with error 87; the probe shows
