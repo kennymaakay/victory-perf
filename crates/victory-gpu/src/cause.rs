@@ -89,6 +89,9 @@ pub(crate) enum Read {
     Copy,
     /// A fill of the list's upload memory from title memory.
     Fill,
+    /// A table's constant buffer view made on a copy in the card's memory
+    /// and filled at its submission after all (`Host::place_constants`).
+    Constant,
     /// A texture's memory brought into its staging buffer.
     Texture,
 }
@@ -98,6 +101,7 @@ impl Read {
         match self {
             Read::Copy => "copy",
             Read::Fill => "fill",
+            Read::Constant => "constant filled after all",
             Read::Texture => "texture",
         }
     }

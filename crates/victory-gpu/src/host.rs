@@ -1751,6 +1751,7 @@ pub(crate) struct Constant {
 /// in it (in order, joined); `shaders_write`, its shaders write the copy;
 /// `flights`, per copy (its number) the title memory the shaders of
 /// flights in the air may write (in order, joined).
+#[cfg(test)]
 fn constant_filled(
     from: usize,
     to: usize,
@@ -1760,10 +1761,38 @@ fn constant_filled(
     shaders_write: bool,
     flights: &[(u64, Vec<(usize, usize)>)],
 ) -> bool {
-    ran || shaders_write
-        || touches(copied, from, to)
-        || flights.iter().any(|(c, ranges)| *c != copy && touches(ranges, from, to))
+    constant_fill_why(from, to, copy, ran, copied, shaders_write, flights).is_some()
 }
+
+/// Why [`constant_filled`] fills (an index of [`CONSTANT_FILL_WHY`]): 0 a step
+/// of ours, 1 a title copy into it, 2 the submission's shaders write the
+/// copy, 3 a flight writes it through another copy.
+fn constant_fill_why(
+    from: usize,
+    to: usize,
+    copy: u64,
+    ran: bool,
+    copied: &[(usize, usize)],
+    shaders_write: bool,
+    flights: &[(u64, Vec<(usize, usize)>)],
+) -> Option<usize> {
+    if ran {
+        Some(0)
+    } else if touches(copied, from, to) {
+        Some(1)
+    } else if shaders_write {
+        Some(2)
+    } else if flights.iter().any(|(c, ranges)| *c != copy && touches(ranges, from, to)) {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+/// Table constant buffer views filled at a submission after all, by why
+/// ([`constant_fill_why`]), since the last card line.
+pub(crate) static CONSTANT_FILL_WHY: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// At each submission: which constant buffer views of tables made on
 /// copies in the card's memory (`Step::Constant`) are filled instead, as
@@ -1839,7 +1868,7 @@ fn place_constants(runs: &[&HostList]) {
                     continue;
                 }
                 let copy = c.shadow.id();
-                let fill = constant_filled(
+                let why = constant_fill_why(
                     c.address,
                     c.address + c.len,
                     copy,
@@ -1848,6 +1877,10 @@ fn place_constants(runs: &[&HostList]) {
                     written.contains(&copy),
                     &flights,
                 );
+                if let Some(why) = why {
+                    CONSTANT_FILL_WHY[why].fetch_add(1, Ordering::Relaxed);
+                }
+                let fill = why.is_some();
                 if fill {
                     crate::draw::TABLE_CBVS[2].fetch_add(1, Ordering::Relaxed);
                 }
@@ -3129,7 +3162,7 @@ fn reads(runs: &[&HostList]) -> (Vec<(crate::cause::Read, usize, usize)>, bool) 
                 }
                 &Step::Fill(_, src, len) => out.push((Read::Fill, src, src + len)),
                 Step::Constant(c) if c.filled.load(Ordering::Relaxed) => {
-                    out.push((Read::Fill, c.address, c.address + c.len));
+                    out.push((Read::Constant, c.address, c.address + c.len));
                 }
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
@@ -6571,6 +6604,7 @@ impl Meter {
         // Constant buffer views of tables made on those copies, those of
         // them filled at a submission after all, and those filled.
         let table_cbvs = [0, 1, 2].map(|i| crate::draw::TABLE_CBVS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        let fill_why = [0, 1, 2, 3].map(|i| CONSTANT_FILL_WHY[i].swap(0, Ordering::Relaxed) as f64 / frames);
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
@@ -6620,8 +6654,8 @@ impl Meter {
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
                      ({:.1} MB) with {:.1} more waits for the card ({:.1} ms); constant buffer views of tables: \
                      {:.0} made on these copies (VICTORY_CBV_DIRECT=0: none), {:.0} of them filled at a submission \
-                     after all (a title copy or a step of ours there, the copy's own shader writes, a flight writing \
-                     it through another copy), {:.0} filled from title memory",
+                     after all (first placings, by why: a step of ours {:.1}, a title copy there {:.1}, the copy's own \
+                     shader writes {:.1}, a flight writing it through another copy {:.1}), {:.0} filled from title memory",
                     card[7],
                     card[8] >> 20,
                     card[9] >> 20,
@@ -6634,6 +6668,10 @@ impl Meter {
                     per_frame(6) / 1e3,
                     table_cbvs[0],
                     table_cbvs[2],
+                    fill_why[0],
+                    fill_why[1],
+                    fill_why[2],
+                    fill_why[3],
                     table_cbvs[1]
                 );
             }
