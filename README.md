@@ -35,7 +35,7 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Saves | the game autosaves a checkpoint and loads it again |
 | First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
 | Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-4 fps: 420-450 ms per frame with every submission waited for, 240-350 ms with the overlap that is now the default (`VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1`, card buffers capped at 768 MB where those runs used 1024); it started at 3-6 seconds per frame |
+| Frame rate in the world | 2-4 fps: 420-450 ms per frame with every submission waited for, 240-350 ms with the overlap that is now the default (`VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1`, card buffers capped at 1280 MB where those runs used 1024); it started at 3-6 seconds per frame |
 | Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
 
 ### What this fork changed (summary)
@@ -64,7 +64,8 @@ The overlap of CPU and card is on by default, and each part can be turned
 back off: `VICTORY_LATE_WAIT=0` (or `1`, `2` for an earlier stage; the
 default is `3`), `VICTORY_WIDE_BACK=0`, and `VICTORY_CARD_BUFFERS_MIN_MB=16
 VICTORY_CARD_BUFFERS_MB=512` for the old card buffer sizes (the defaults are
-1 and 768, chosen for 8 GB cards). The timing run (`VICTORY_GPU_TIMING`)
+1 and 1280; at 768 the cap was full on an 8 GB card and the CPU still
+compared 142 MB a frame). The timing run (`VICTORY_GPU_TIMING`)
 turns the late wait off, and `VICTORY_INPLACE=2` does unless it is set. Other newer
 speed changes sit behind switches that are off by default (`VICTORY_RELAY`,
 `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...). Each is described in a

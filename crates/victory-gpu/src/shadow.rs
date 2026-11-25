@@ -142,7 +142,7 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (the hashes of their pieces not counted, 16
 /// bytes a 64 KiB piece), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (768).
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (1280).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
 ///
@@ -150,21 +150,28 @@ pub(crate) fn cards() -> bool {
 /// side are what the CPU still compares after the card ([`back_line`]
 /// counts them), so they go to the card too; the faster runs used 1 and
 /// 1024. With 1 the small buffers compete for the cap with the big ones,
-/// which are made in no fixed order, so the cap is raised past 512, and
-/// 768 rather than 1024 for cards of 8 GB: copies are 274 MB over run 69's
+/// which are made in no fixed order, so the cap is raised past 512, at
+/// first to 768 rather than 1024 for cards of 8 GB: copies are 274 MB over run 69's
 /// at most, which leaves about 1.4 GB of those 1,650 MB free where 1024
 /// would leave about 1.1 (with the twins copies had before the hashes,
 /// 1.1 and 0.6). The rule in
 /// [`card_for`] (a fifth of the budget free when a copy is made) still
 /// holds for each copy; a copy that does not fit stays on the PC's side,
 /// as any copy did before.
+///
+/// 768 was too low in the prologue on an 8 GB RTX 2080 SUPER: the cap was
+/// full (77 copies, 767 MB) and 142 MB of buffers of 1 MiB or more stayed
+/// on the PC's side, compared by the CPU every frame. At 1280 the copies
+/// took 941 MB (97 copies), the CPU compared 25 MB a frame instead of 165,
+/// and the median frame went from 886 to 451 ms (same scene, same cache).
+/// The fifth-free rule is what protects a smaller card.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 768))
+        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1280))
     })
 }
 
