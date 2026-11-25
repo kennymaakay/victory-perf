@@ -1713,8 +1713,9 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of a buffer's host copy;
+    /// what declared it, for `crate::cause`.
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, crate::cause::Declarer),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -1749,6 +1750,10 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// The shader of the pipeline the draw or dispatch being recorded
+    /// uses ([`HostList::declaring`]), named with the ranges it declares
+    /// written (`crate::cause`).
+    declarer: Option<std::sync::Arc<crate::pipeline::Shader>>,
 }
 
 impl Deferred {
@@ -2135,6 +2140,8 @@ struct Sent {
     sends: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// `back` with what declared each range, for `crate::cause`.
+    declared: Vec<crate::cause::Declaration>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -2170,6 +2177,11 @@ struct Line {
     /// The title memory the flights' shaders may write (address, end), in
     /// order and joined.
     written: Vec<(usize, usize)>,
+    /// What makes up `written`, per flight (its number) in the line's
+    /// order, with what declared each range: kept and dropped with
+    /// `written`, read only to name why a submission waited
+    /// (`crate::cause`).
+    declared: Vec<(u64, Vec<crate::cause::Declaration>)>,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -2196,6 +2208,7 @@ unsafe impl Send for Line {}
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
     written: Vec::new(),
+    declared: Vec::new(),
     lists: 0,
     target: 0,
     settling: false,
@@ -2539,10 +2552,10 @@ fn late_threads() {
 /// time flights have landed. Counted as a settle for `why`, and its time
 /// as waiting for the card. The caller may hold the submission lock: the
 /// thread that lands flights never takes it.
-fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) -> u64 {
     let mut line = line();
     if done(&line) {
-        return;
+        return 0;
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
@@ -2558,6 +2571,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    us
 }
 
 /// What the thread that lands flights fetches card copies' pieces with
@@ -2868,7 +2882,7 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
+            if let Step::GpuWrite(shadow, address, len, _) = step {
                 let range = (*address, *address + *len);
                 match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                     Some((_, ranges)) => {
@@ -2882,6 +2896,81 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
         }
     }
     back
+}
+
+/// The ranges `runs`' shaders may write with what declared each, once
+/// per range and declarer, for `crate::cause`: a flight sent ahead keeps
+/// them while it is in the air.
+fn declarations(runs: &[&HostList]) -> Vec<crate::cause::Declaration> {
+    let mut out: Vec<crate::cause::Declaration> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::GpuWrite(shadow, address, len, declarer) = step {
+                let by = declarer.by.as_ref().map_or(0, |s| std::sync::Arc::as_ptr(s) as usize);
+                if seen.insert((shadow.id(), *address, *len, declarer.origin as u8, by)) {
+                    out.push(crate::cause::Declaration {
+                        from: *address,
+                        to: *address + *len,
+                        copy: shadow.id(),
+                        declarer: declarer.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The title memory `runs` read on the CPU at preparing, as
+/// [`blocked_by`] looks at it (kind, address, end), for `crate::cause`;
+/// and whether they have a step of ours, which [`blocked_by`] waits for
+/// the whole line for.
+fn reads(runs: &[&HostList]) -> (Vec<(crate::cause::Read, usize, usize)>, bool) {
+    use crate::cause::Read;
+    let mut out = Vec::new();
+    let mut ours = false;
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                &Step::Copy(dst, src, len) => {
+                    out.push((Read::Copy, src, src + len));
+                    out.push((Read::Copy, dst, dst + len));
+                }
+                &Step::Fill(_, src, len) => out.push((Read::Fill, src, src + len)),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    out.push((Read::Texture, at, at + len));
+                }
+                Step::Run(_) => ours = true,
+                _ => {}
+            }
+        }
+    }
+    (out, ours)
+}
+
+/// Why `runs` are about to wait for flights over title memory they read:
+/// the read and the declaration in the way (`crate::cause`). Looked for
+/// only when a submission waits; `settles` when the wait is a settle.
+///
+/// A step of ours in `runs` comes after the read (one before it would
+/// have made the wait a [`WHY_RUN`] one), and the wait's condition then
+/// holds until the whole line has landed: said with the cause, so the
+/// named flight is not booked for the others.
+fn read_cause(runs: &[&HostList], settles: bool) -> Option<crate::cause::Cause> {
+    use crate::cause::Until;
+    let (reads, ours) = reads(runs);
+    let until = if settles {
+        Until::Settle
+    } else if ours {
+        Until::Run
+    } else {
+        Until::Declared
+    };
+    let line = line();
+    let flights: Vec<&[crate::cause::Declaration]> = line.declared.iter().map(|(_, d)| d.as_slice()).collect();
+    crate::cause::find(&reads, &flights, until)
 }
 
 /// After `list` has run: the texels its read-backs copied into host
@@ -3249,7 +3338,7 @@ impl Host {
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
+                if let Step::GpuWrite(shadow, address, len, _) = step
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
@@ -3840,11 +3929,12 @@ impl Host {
         }
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
-        {
+        let landed_declared = {
             let mut line = line();
             let Line {
                 line: items,
                 written,
+                declared,
                 lists,
                 settling,
                 poke,
@@ -3865,11 +3955,19 @@ impl Host {
                 }
             }
             join_ranges(written, ranges);
+            let (flying, gone) = std::mem::take(declared).into_iter().partition(|(number, _)| {
+                items.iter().any(|item| matches!(item, Late::Run(flight) if flight.number == *number))
+            });
+            *declared = flying;
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
             *poke = true;
-        }
+            gone
+        };
+        // Out of the line's lock: the landed flights' declarations may hold
+        // the last reference to a shader the title has released.
+        drop::<Vec<(u64, Vec<crate::cause::Declaration>)>>(landed_declared);
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
     }
@@ -4050,8 +4148,11 @@ impl Host {
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, declared, lists: flying, target, .. } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            if !sent.declared.is_empty() {
+                declared.push((sent.number, sent.declared));
+            }
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4095,8 +4196,11 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, declared, lists: flying, target, .. } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            if !sent.declared.is_empty() {
+                declared.push((sent.number, sent.declared));
+            }
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4129,10 +4233,10 @@ impl Host {
     ///
     /// Everything in the air is settled, never the first flights alone:
     /// the merge writes the copies' CPU side, which a flight still on the
-    /// card may be writing too.
-    fn settle(&self, submitted: &mut u64, why: usize) {
+    /// card may be writing too. Says whether it waited for anything.
+    fn settle(&self, submitted: &mut u64, why: usize) -> bool {
         if !late() {
-            return;
+            return false;
         }
         if relay() {
             // Nothing is settled here: the thread that lands flights does
@@ -4140,13 +4244,12 @@ impl Host {
             // nothing is being landed. Every point that settled before
             // comes here, so each still sees title memory, fences and
             // bottom-of-pipe values as after a settle.
-            relay_wait(why, |line| line.line.is_empty() && !line.settling);
-            return;
+            return relay_wait(why, |line| line.line.is_empty() && !line.settling) > 0;
         }
         let was_working = working(true);
         let mut counted = false;
         loop {
-            let items = {
+            let (items, declared) = {
                 let mut line = line();
                 if line.line.is_empty() {
                     line.settling = false;
@@ -4155,8 +4258,11 @@ impl Host {
                 line.settling = true;
                 line.written.clear();
                 line.lists = 0;
-                std::mem::take(&mut line.line)
+                (std::mem::take(&mut line.line), std::mem::take(&mut line.declared))
             };
+            // Out of the line's lock: it may hold the last reference to a
+            // shader the title has released.
+            drop(declared);
             let flights = items.iter().filter(|i| matches!(i, Late::Run(_))).count();
             if !counted {
                 counted = true;
@@ -4269,6 +4375,7 @@ impl Host {
             }
         }
         working(was_working);
+        counted
     }
 
     /// [`Host::execute`], or with `late` the first half of
@@ -4291,12 +4398,21 @@ impl Host {
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
-            if relay_exact() && why == WHY_READ {
+            // What read what, and whose declaration was in the way.
+            let exact = relay_exact();
+            let cause = if why == WHY_READ { read_cause(runs, !exact) } else { None };
+            let waiting = std::time::Instant::now();
+            let waited = if exact && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none())
+            } else if self.settle(&mut submitted, why) {
+                waiting.elapsed().as_micros() as u64
             } else {
-                self.settle(&mut submitted, why);
+                0
+            };
+            if why == WHY_READ && waited > 0 {
+                crate::cause::record(cause.as_ref(), waited);
             }
         }
         let behind = late && flying();
@@ -4418,6 +4534,7 @@ impl Host {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             let back = declared_writes(runs);
+            let declared = declarations(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
@@ -4428,6 +4545,7 @@ impl Host {
                 sends,
                 card,
                 back,
+                declared,
                 writes,
             };
             working(was_working);
@@ -5335,10 +5453,28 @@ impl HostList {
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+        origin: crate::cause::Origin,
     ) {
-        self.deferred()
+        let mut deferred = self.deferred();
+        let declarer = crate::cause::Declarer { origin, by: deferred.declarer.clone() };
+        deferred
             .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+            .push(Step::GpuWrite(shadow.clone(), address, len, declarer));
+    }
+
+    /// The draw or dispatch being recorded uses `shader`'s pipeline: the
+    /// ranges it declares written are named with it (`crate::cause`). Kept
+    /// until the next one; a pipeline bound again costs a compare.
+    pub(crate) fn declaring(&self, shader: Option<&std::sync::Arc<crate::pipeline::Shader>>) {
+        let mut deferred = self.deferred();
+        let same = match (&deferred.declarer, shader) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            deferred.declarer = shader.cloned();
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -5565,7 +5701,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, _) => {
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -6142,6 +6278,7 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
+        crate::cause::line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {

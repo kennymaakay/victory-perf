@@ -19,6 +19,8 @@
 mod account;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod cause;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

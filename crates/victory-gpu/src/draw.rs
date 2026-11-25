@@ -911,6 +911,8 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        // What it declares written is named with its shader (`crate::cause`).
+        list.declaring(crate::pipeline::declarer(self.pipeline as This));
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         // Heaps first: a root signature with directly indexed heaps must be
@@ -1162,7 +1164,7 @@ impl State {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
-                s.gpu_writes(list, a, len);
+                s.gpu_writes(list, a, len, crate::cause::Origin::RootUav);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -2756,7 +2758,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
-                shadow.gpu_writes(list, address, len);
+                shadow.gpu_writes(list, address, len, crate::cause::Origin::TableUav);
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

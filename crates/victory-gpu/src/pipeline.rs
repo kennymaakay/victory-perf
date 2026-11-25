@@ -367,6 +367,20 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+/// The shader that names a pipeline in `crate::cause`'s line: its last
+/// stage's container in description order (a compute pipeline's only one;
+/// a graphics pipeline's geometry, else hull, else domain stage, else its
+/// pixel or vertex stage), which labels the pipeline, not necessarily the
+/// stage that stores. The pipeline must be live: a list is recording a
+/// draw or dispatch with it.
+#[cfg(windows)]
+pub(crate) fn declarer<'a>(this: This) -> Option<&'a Arc<Shader>> {
+    if this.is_null() {
+        return None;
+    }
+    pipeline(this).shaders.last()
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
