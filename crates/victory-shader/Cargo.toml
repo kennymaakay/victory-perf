@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 thiserror.workspace = true
-miniz_oxide.workspace = true
+zlib-rs.workspace = true
 
 [build-dependencies]
 # The source fingerprint the shader cache is keyed by (build.rs).

@@ -35,7 +35,7 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Saves | the game autosaves a checkpoint and loads it again |
 | First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
 | Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-4 fps: 420-450 ms per frame with every submission waited for, 240-350 ms with the overlap that is now the default (`VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1`, card buffers capped at 1280 MB where those runs used 1024); it started at 3-6 seconds per frame |
+| Frame rate in the world | 2-4 fps: 420-450 ms per frame with every submission waited for, about 230-350 ms with the overlap that is now the default (see below); it started at 3-6 seconds per frame |
 | Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
 
 ### What this fork changed (summary)
@@ -48,12 +48,13 @@ Rendering:
 - Gathers at a named mip level (with and without an offset) read level 0; fixed.
 - Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
 - Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
+- From upstream: the depth bounds test is set on the host; textures picked by index are looked at again after their upload, so a texture filled later is uploaded again (`VICTORY_HEAP_RECHECK=0` turns it off); double-precision shader instructions translate.
 - Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
 
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
 - Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
-- Submissions are sent ahead of the wait for the card, the present too (on by default; `VICTORY_LATE_WAIT=0` waits for each). A relay thread that lands results as the card finishes (`VICTORY_RELAY=1` or `2`) stays off: in a first five-minute run it cut the card's idle time behind the submitting thread from about 136 to 30 ms per frame, but a tester saw it present frames out of order or blank, which stage 3 alone does not.
+- Submissions are sent ahead of the wait for the card, the present too, and a relay thread lands results as the card finishes, fetching card copies on a copy queue of its own. In a first five-minute run the relay cut the card's idle time behind the submitting thread from about 136 to 30 ms per frame. A tester on an RTX 3080 once saw it present frames out of order or blank; on an RTX 2080 SUPER it showed no such problem and ran at 4.0-4.2 fps where it was 3.2 without.
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
 - An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
@@ -61,15 +62,25 @@ Speed and memory:
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
 The overlap of CPU and card is on by default, and each part can be turned
-back off: `VICTORY_LATE_WAIT=0` (or `1`, `2` for an earlier stage; the
-default is `3`), `VICTORY_WIDE_BACK=0`, and `VICTORY_CARD_BUFFERS_MIN_MB=16
-VICTORY_CARD_BUFFERS_MB=512` for the old card buffer sizes (the defaults are
-1 and 1280; at 768 the cap was full on an 8 GB card and the CPU still
-compared 142 MB a frame). The timing run (`VICTORY_GPU_TIMING`)
-turns the late wait off, and `VICTORY_INPLACE=2` does unless it is set. Other newer
-speed changes sit behind switches that are off by default (`VICTORY_RELAY`,
-`VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...). Each is described in a
-comment where it is read.
+back off:
+
+| Default | Off, or the value before |
+|---------|--------------------------|
+| late wait at stage 3 (the present is sent ahead too) | `VICTORY_LATE_WAIT=0`, or `1`, `2` for an earlier stage |
+| relay at stage 2 (it rides on stage 3) | `VICTORY_RELAY=0`, or `1` for its first stage |
+| relay fetches on a copy queue | `VICTORY_RELAY_COPY_QUEUE=0` |
+| 256 host lists in the air | `VICTORY_LATE_WAIT_LISTS=128` |
+| wide copy-back | `VICTORY_WIDE_BACK=0` |
+| card copies from 1 MiB up, 1280 MB in all | `VICTORY_CARD_BUFFERS_MIN_MB=16 VICTORY_CARD_BUFFERS_MB=512` |
+
+Upstream caps card copies at 1024 MB; here the cap is 1280 because at 768 it
+was full on an 8 GB card and the CPU still compared 142 MB a frame, while at
+1280 the copies took 941 MB. The timing run (`VICTORY_GPU_TIMING`) turns the
+late wait and the relay off, and `VICTORY_INPLACE=2` does too unless
+`VICTORY_LATE_WAIT` or `VICTORY_RELAY` is set. Other newer speed changes sit
+behind switches that are off by default (`VICTORY_INPLACE`,
+`VICTORY_BVH_BUILDER`, ...). Each is described in a comment where it is
+read.
 
 ### Known problems
 

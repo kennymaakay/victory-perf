@@ -166,7 +166,10 @@ pub(crate) fn cards() -> bool {
 /// on the PC's side, compared by the CPU every frame. At 1280 the copies
 /// took 941 MB (97 copies), the CPU compared 25 MB a frame instead of 165,
 /// and the median frame went from 886 to 451 ms (same scene, same cache).
-/// The fifth-free rule is what protects a smaller card.
+/// The fifth-free rule is what protects a smaller card. Upstream moved to
+/// 1 and 1,024 by default as well (the smaller buffers' shader writes are
+/// then found by the card's hashes, and the first room's walls drew in
+/// every run); 1280 keeps the room the 2080 SUPER needed.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
@@ -476,10 +479,10 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default, unlike the late wait it
-/// rides on, for the reason `crate::host::relay` gives; not with kept
-/// snapshots, [`keeps`]). `crate::host::relay` says what it does; here it changes
-/// what a copy keeps:
+/// (on by default at stage 2, like the late wait it rides on;
+/// `VICTORY_RELAY=0` turns it off, `1` asks for the first stage; not with
+/// kept snapshots, [`keeps`]). `crate::host::relay` says what it does; here
+/// it changes what a copy keeps:
 ///
 /// - the ranges shaders may be writing are counted per submission
 ///   ([`Flights`]): a range two flights declared stays closed to refreshes
@@ -493,7 +496,12 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
+    // On by default (stage 2, `crate::host::relay_exact`); `VICTORY_RELAY=0`
+    // turns it off, `=1` asks for the first stage.
+    // The crate's own tests run without it unless they ask: several of
+    // them look at title memory right after a submission, which the
+    // relay's landing thread may still be writing.
+    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
 }
 
 /// The submission being prepared (its number among those started): what
@@ -1592,17 +1600,20 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_MS: u64 = 10_000;
     const IDLE_FRAMES: u64 = 4;
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return;
+        }
+        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)

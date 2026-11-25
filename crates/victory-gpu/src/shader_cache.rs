@@ -42,7 +42,8 @@ pub(crate) fn counts() -> (u64, u64) {
 /// fingerprint (`victory_shader::SOURCE_HASH`, every file of its `src` and
 /// its features), this file (the entry's encoding is in it), and the
 /// translation settings the run uses (the loop limit, which a diagnostics
-/// build can change at run time, and the switches below).
+/// build can change at run time, the host's view heap limit, and the
+/// switches below).
 ///
 /// It was the BLAKE3 of our whole executable, so every rebuild, even one
 /// that changed nothing in the translator, threw every translation away:
@@ -61,6 +62,10 @@ fn build() -> &'static [u8; 32] {
         let mut bytes = victory_shader::SOURCE_HASH.to_vec();
         bytes.extend_from_slice(include_bytes!("shader_cache.rs"));
         bytes.extend_from_slice(&limit.to_le_bytes());
+        // So is the view heap's null slot (it differs by host GPU):
+        // a translation cached without the clamp must not be served.
+        crate::descriptor::host::probe_view_limit();
+        bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
         // So are the switches that pick the form of a wave64 program:
