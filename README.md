@@ -72,7 +72,6 @@ back off:
 | 256 host lists in the air | `VICTORY_LATE_WAIT_LISTS=128` |
 | wide copy-back | `VICTORY_WIDE_BACK=0` |
 | card copies from 1 MiB up, 1280 MB in all | `VICTORY_CARD_BUFFERS_MIN_MB=16 VICTORY_CARD_BUFFERS_MB=512` |
-| table constant buffers in card copies bound on the copy (256-byte aligned ones), so no fill waits for flights; filled as before in a submission that copies into them or writes the copy, or behind a flight writing them through another copy | `VICTORY_CBV_DIRECT=0` |
 
 Upstream caps card copies at 1024 MB; here the cap is 1280 because at 768 it
 was full on an 8 GB card and the CPU still compared 142 MB a frame, while at

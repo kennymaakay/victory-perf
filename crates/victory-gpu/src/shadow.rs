@@ -2870,14 +2870,6 @@ impl Shadow {
         self.card.is_some()
     }
 
-    /// Of a copy in the card's memory: the bytes of the card side's buffer
-    /// (the title buffer's, rounded up to 64 KiB) from a title address in
-    /// the copy to the buffer's end. `None` for other copies.
-    pub(crate) fn card_room(&self, address: u64) -> Option<u64> {
-        let card = self.card.as_ref()?;
-        card.size.checked_sub(address.checked_sub(self.start)?)
-    }
-
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {
@@ -3305,23 +3297,6 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
-}
-
-/// The copy of the innermost title buffer holding `[address, address +
-/// len)`, as [`find`] picks it, if that copy is made already and is in the
-/// card's memory ([`cards`]). Makes nothing: memory outside buffers and
-/// buffers without a copy (or with one in the PC's memory) give `None`.
-/// shortcut: windows outside buffers in the card's memory
-/// (`VICTORY_CARD_WINDOWS_MB`, off by default) are not looked at.
-pub(crate) fn find_carded(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let end = address.checked_add(len.max(1))?;
-    let map = buffers();
-    let (_, entry) = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)?;
-    entry.shadow.as_ref().filter(|s| s.carded()).cloned()
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has

@@ -465,89 +465,6 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
-/// Whether a constant buffer view in a descriptor table whose memory lies
-/// in a title buffer's copy in the card's memory ([`crate::shadow::cards`])
-/// is made on that copy, as an aligned root constant buffer is
-/// ([`root_view`]) (`VICTORY_CBV_DIRECT=0`: no, every one is filled from
-/// title memory into the list's upload memory at submission, as before).
-///
-/// A fill reads title memory on the CPU, so a submission that has one
-/// waits for every flight in the air whose shaders may write that memory
-/// (`Host::submit`, `WHY_READ`). Measured on the RTX 2080 SUPER: a compute
-/// pass binds a table unordered view over the whole 182 MB title buffer
-/// (a card copy), so each of its flights declares all of it written, and
-/// a 480-byte constant buffer of a table inside it was filled every frame
-/// behind that flight: 100-140 ms a frame of waiting, for the 3-4 MB the
-/// card really changes.
-///
-/// Made on the copy, the view needs no bytes from the CPU, and what it
-/// reads is what the console's GPU reads at that point in the queue: the
-/// card runs lists in queue order, and the card side of the copy holds
-/// (a) the title's own writes, brought up to date by the refresh recorded
-/// here and sent up by `Host::card_before` in a list of ours that goes to
-/// the queue ahead of the submission's lists (title bytes under ranges
-/// flights may write are put in beside their writes,
-/// `Shadow::merge_under_writes`, or the flights are settled, `WHY_STALE`,
-/// as for any buffer view of a card copy), and (b) what the shaders of
-/// earlier flights wrote, which they wrote into this very buffer, and
-/// earlier lists of the same submission behind the title's barrier (a
-/// barrier on a buffer becomes one on every resource, `list::barrier`).
-/// Resource state is as for the copy's other views: its buffer is in the
-/// common state and promoted by use, unordered access and reads alike, as
-/// root constant buffers, root views and table buffer views of card copies
-/// already use it with no barrier of their own.
-///
-/// Only where D3D12 takes it as it is ([`direct_cbv`]): the view's start
-/// 256-byte aligned on the host, its size rounded up to 256 within 64 KiB
-/// and within the card side's buffer, all of the view in the title buffer.
-/// Elsewhere, and for copies in the PC's memory or memory without a copy,
-/// the fill stays. And only where the submission allows it: the copy holds
-/// one version of its bytes per submission, so a submission with a title
-/// copy into the view's memory (or a step of ours that may write title
-/// memory), with shaders writing the copy (a transition the title's lists
-/// lack), or behind a flight writing that memory through another copy,
-/// fills the view after all, in order with its other steps
-/// (`crate::host`'s `place_constants`): the upload memory for that is
-/// taken for every view.
-fn cbv_direct() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_DIRECT").is_none_or(|v| v != "0"))
-}
-
-/// Since the last frame line: constant buffer views of tables made on
-/// copies in the card's memory ([`cbv_direct`]), those filled from title
-/// memory, and those of the first filled at a submission after all.
-pub(crate) static TABLE_CBVS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-
-/// The size a constant buffer view of `size` title bytes is made with at
-/// host GPU address `gpu` of a copy (`left`: title bytes from the view's
-/// start to the title buffer's end; `room`: bytes from there to the end of
-/// the host buffer), if it can be made there: `on` ([`cbv_direct`]), a
-/// start 256-byte aligned, the view inside the title buffer, and its size
-/// rounded up to 256 no more than 64 KiB and inside the host buffer.
-fn direct_cbv(on: bool, gpu: u64, size: u32, left: u64, room: u64) -> Option<u32> {
-    if !on || size == 0 || !gpu.is_multiple_of(256) || u64::from(size) > left {
-        return None;
-    }
-    let rounded = size.checked_next_multiple_of(256)?;
-    (rounded <= 1 << 16 && u64::from(rounded) <= room).then_some(rounded)
-}
-
-/// A constant buffer view of a table, `size` bytes at title `address`, on
-/// the copy in the card's memory that holds it ([`cbv_direct`]): the copy,
-/// the host GPU address and size to make it with, the range refreshed for
-/// `list`. `None`: it is filled.
-fn cbv_on_card(list: &HostList, address: u64, size: u32) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u32)> {
-    if !cbv_direct() {
-        return None;
-    }
-    let shadow = crate::shadow::find_carded(address, u64::from(size))?;
-    let gpu = shadow.gpu(address);
-    let rounded = direct_cbv(true, gpu, size, shadow.left(address), shadow.card_room(address)?)?;
-    shadow.refresh(list, address, u64::from(size));
-    Some((shadow, gpu, rounded))
-}
-
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -2646,22 +2563,6 @@ impl State {
                             host.make_null(index);
                             continue;
                         };
-                        // On the copy in the card's memory if it can be:
-                        // nothing to fill, nothing to wait for, unless the
-                        // submission fills it after all (into `to`).
-                        if let Some((shadow, card, rounded)) = cbv_on_card(list, address, size) {
-                            TABLE_CBVS[0].fetch_add(1, Ordering::Relaxed);
-                            host.constant_at(index, card, rounded);
-                            // The slot is the list's until its submission
-                            // has run (`State::tables_done`), the heap
-                            // alive while the list holds it.
-                            let slot = host.slot_handle(index);
-                            list.defer_constant(&shadow, address as usize, size as usize, to, move || {
-                                crate::descriptor::host::constant_view(slot, gpu, size)
-                            });
-                            continue;
-                        }
-                        TABLE_CBVS[1].fetch_add(1, Ordering::Relaxed);
                         list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
                     }
@@ -3473,47 +3374,5 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::direct_cbv;
-
-    const BIG: u64 = 1 << 30;
-
-    #[test]
-    fn a_table_constant_buffer_is_made_on_the_copy_only_aligned() {
-        assert_eq!(direct_cbv(true, 0x1_0000_0100, 480, BIG, BIG), Some(512));
-        assert_eq!(direct_cbv(true, 0x1_0000_0110, 480, BIG, BIG), None);
-        assert_eq!(direct_cbv(true, 0x1_0000_0080, 256, BIG, BIG), None);
-    }
-
-    #[test]
-    fn its_size_is_rounded_up_to_256_within_64_kib() {
-        assert_eq!(direct_cbv(true, 0, 1, BIG, BIG), Some(256));
-        assert_eq!(direct_cbv(true, 0, 256, BIG, BIG), Some(256));
-        assert_eq!(direct_cbv(true, 0, 257, BIG, BIG), Some(512));
-        assert_eq!(direct_cbv(true, 0, 65536, BIG, BIG), Some(65536));
-        assert_eq!(direct_cbv(true, 0, 65537, BIG, BIG), None);
-        assert_eq!(direct_cbv(true, 0, u32::MAX, BIG, BIG), None);
-        // An empty view keeps the fill.
-        assert_eq!(direct_cbv(true, 0, 0, BIG, BIG), None);
-    }
-
-    #[test]
-    fn it_never_reaches_past_the_title_buffer_or_the_host_buffer() {
-        // The view itself past the title buffer's end: its bytes there are
-        // in no copy.
-        assert_eq!(direct_cbv(true, 0x100, 480, 479, BIG), None);
-        assert_eq!(direct_cbv(true, 0x100, 480, 480, BIG), Some(512));
-        // Rounded up past the host buffer's end.
-        assert_eq!(direct_cbv(true, 0x100, 480, 480, 511), None);
-        assert_eq!(direct_cbv(true, 0x100, 480, 480, 512), Some(512));
-    }
-
-    #[test]
-    fn the_switch_off_keeps_the_fill() {
-        assert_eq!(direct_cbv(false, 0x1_0000_0100, 480, BIG, BIG), None);
     }
 }
