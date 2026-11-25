@@ -1,3 +1,81 @@
+# victory-perf: VIctory on a mid-range 8 GB PC, for frame rate
+
+A performance-focused fork of [VIctory](https://github.com/Marvisak/VIctory) (Marvisak and
+contributors) by way of [fxceless/victory-fork](https://github.com/fxceless/victory-fork),
+measured on a 2019 mid-range PC: **RTX 2080 SUPER 8 GB (Turing), i9-9900 (Intel, no
+MONITORX/CLZERO), 32 GB RAM, Windows 11.** The goal here is frame rate; the picture is as
+upstream (stretched or missing mesh parts, dark shadows).
+
+**This repository contains no game files, code, shaders or assets.** You need your own copy
+of the game. It is not affiliated with or endorsed by the game's developer or publisher.
+Nothing here connects to any online service.
+
+## State (2026-11-25)
+
+**Not playable yet: about 6 fps** standing in the opening in-engine scene.
+
+| same build, same scene | `VICTORY_INDIRECT_WINDOW=1` | windows off |
+|---|---:|---:|
+| fps | 5.7–6.5 | 4.3–4.6 |
+| ms/frame | ~163 | ~228 |
+| submitting thread waiting for the card | 40–61 ms | 85–108 ms |
+| card busy | ~70 % | ~78 % |
+
+One run each, draws and drops matching between the runs; details on fxceless/victory-fork#220.
+`VICTORY_INDIRECT_WINDOW_CHECK=1` over 3.6 million window draws found 86 that differed, all
+in one execution when the scene began, none after. The intro video plays in order (#602).
+
+**Where the frame goes now: the CPU, not the card.** The submitting thread prepares ~108 ms
+and then waits ~45–60 ms, every frame, for one cause: a small read (a 480-byte constant
+buffer, or behind it a 20 KB buffer copy) inside a 182 MB range that one GPU-driven culling
+compute declares written, though it changes ~2–4 MB of it. The copy-back thread lands
+~104 ms a frame. That wait is what this fork works on next.
+
+## What it carries over fxceless main
+
+Pull requests of fxceless/victory-fork (authors credited in the history):
+- #220 by venglov: cheaper indirect draws (windows, one budget charge per group, budget in
+  card memory). Run with `VICTORY_INDIRECT_WINDOW=1`.
+- #602 by lukkasremondi: the opening video plays in order.
+- #462 by iurysf: table constant buffers filled on the card (`VICTORY_FILL_ON_CARD=0` turns
+  it off). On this machine it removes the constant-buffer wait, but the wait moves to the
+  buffer copy behind it: no change in frame time yet.
+
+Changes of this fork:
+- The card and the submitting thread overlap by default; copy-queue relay fetches.
+- Card copies capped at 1280 MB by default (8 GB cards).
+- Shader cache keyed by the translator's sources, so a rebuild keeps its translations.
+- Intel CPUs: `monitorx`, `mwaitx` and `clwb` are patched in place at load with a one-byte
+  store instead of trapping on every use (`VICTORY_PATCH_WAITS=0` turns it off).
+- Bytes merged from a card copy are not sent back up to it (`VICTORY_ECHO=1` restores it).
+- Diagnostics: a per-period account of the CPU's bytes and our memory
+  (`VICTORY_ACCOUNT_CSV`), per-kind counts of emulated console instructions, and
+  "settle causes": what each wait of the submitting thread waits for.
+
+## How it is run here
+
+```powershell
+$env:VICTORY_HEAP_RECHECK='0'; $env:VICTORY_EARLY_TEXTURES_MS='0'; $env:VICTORY_BAKE_TEXTURES_MS='0'
+$env:VICTORY_INDIRECT_WINDOW='1'
+victory run <path to game_scarlett_master.exe> --execute
+```
+
+The three texture switches are off because on an 8 GB card those passes fill video memory
+and the card copies no longer fit (fxceless/victory-fork#594). The first launch after a
+build translates every shader: the loading screen can stay frozen, with sound, for minutes.
+
+## Credits
+
+- [VIctory](https://github.com/Marvisak/VIctory) by Marvisak and contributors,
+  GPL-3.0-or-later; so is this fork.
+- [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and the authors of the
+  pull requests above.
+- Developed with [Claude Code](https://claude.com/claude-code).
+
+Everything below this line is fxceless/victory-fork's own README, unchanged.
+
+---
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
