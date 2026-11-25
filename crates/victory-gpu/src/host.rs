@@ -3227,6 +3227,7 @@ impl Host {
                         for &(a, b) in ranges {
                             list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                            shadow.counted(crate::account::Op::SentUp, b - a);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         let Some(before) = before else {
@@ -3486,6 +3487,8 @@ impl Host {
                 if again && seen.insert((copy, lo, hi)) {
                     pieces.push((shadow.clone(), lo, hi, total));
                     total += (hi - lo) as u64;
+                    // Fetched again; it was counted differing the first time.
+                    shadow.counted(crate::account::Op::Fetched, hi - lo);
                 }
                 if until > landed.0 {
                     f.unsure.push((shadow, lo, hi, until));
@@ -3519,9 +3522,19 @@ impl Host {
                         if lo < hi && seen.insert((copy, lo, hi)) {
                             pieces.push((r.shadow.clone(), lo, hi, total));
                             total += (hi - lo) as u64;
+                            r.shadow.counted(crate::account::Op::Fetched, hi - lo);
+                            // Differing only where the compare ran and
+                            // flagged this piece (a range it did not compare
+                            // is fetched whole, found nothing).
+                            if r.compared && differs.get((r.at + p) as usize).is_none_or(|&d| d != 0) {
+                                r.shadow.counted(crate::account::Op::Differing, hi - lo);
+                            }
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+                    if r.compared {
+                        r.shadow.counted(crate::account::Op::Compared, r.span.to.saturating_sub(r.span.from) as usize);
+                    }
                 }
             }
         }
@@ -3799,9 +3812,17 @@ impl Host {
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
+                    r.shadow.counted(crate::account::Op::Fetched, hi - lo);
+                    // Differing only where the compare ran and flagged it.
+                    if r.compared {
+                        r.shadow.counted(crate::account::Op::Differing, hi - lo);
+                    }
                 }
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+            if r.compared {
+                r.shadow.counted(crate::account::Op::Compared, r.span.to.saturating_sub(r.span.from) as usize);
+            }
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
@@ -5390,6 +5411,12 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
+                    crate::account::add(
+                        crate::account::Op::StepCopy,
+                        crate::account::Mem::Unknown,
+                        crate::account::Side::Direct,
+                        len as u64,
+                    );
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -5399,6 +5426,12 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    crate::account::add(
+                        crate::account::Op::StepFill,
+                        crate::account::Mem::Unknown,
+                        crate::account::Side::Direct,
+                        len as u64,
+                    );
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -5570,14 +5603,21 @@ impl Batch {
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
+            let copy_before = crate::account::copy_us();
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
                 .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
                 .collect();
             crate::shadow::wide_run(jobs);
+            let elapsed = started.elapsed().as_micros() as u64;
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            PREPARING[0].fetch_sub(summed.saturating_sub(elapsed), Ordering::Relaxed);
+            // The account's refresh copy time likewise: the threads' share
+            // of copying, of the time the refreshes took, so that it stays
+            // part of the copies' time and its rate is the bytes moved per
+            // second of the frame, not per thread.
+            crate::account::copy_wall(crate::account::copy_us().saturating_sub(copy_before), summed, elapsed);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
@@ -5919,6 +5959,14 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    /// The frame line's buckets since the last account, summed second by
+    /// second: the account covers its whole five seconds
+    /// ([`crate::account`]).
+    account: crate::account::Window,
+    /// Whether the account counts yet: not in the first second, whose
+    /// buckets also hold the work done while the title loaded, before the
+    /// first present; it starts at the end of that second.
+    accounting: bool,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -5933,6 +5981,8 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            account: crate::account::Window::default(),
+            accounting: false,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -5947,6 +5997,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        crate::account::presented();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -5963,16 +6014,21 @@ impl Meter {
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
+        let submission = [0, 1].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed));
+        let [cpu, gpu] = submission.map(|us| us as f64 / 1000.0 / frames);
+        let preparing = [0, 1, 2, 3].map(|i| PREPARING[i].swap(0, Ordering::Relaxed));
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
+            preparing[i] as f64 / scale / frames
         });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
+        let back = [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed));
+        let [back_ms, back_mb] = [0, 1].map(|i| back[i] as f64 / [1e3, 1e6][i] / frames);
+        if self.accounting {
+            self.account.add(frames as u64, elapsed.as_micros() as u64, submission, preparing, back);
+        } else {
+            crate::account::start();
+            self.accounting = true;
+        }
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -6039,6 +6095,7 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            crate::account::log(std::mem::take(&mut self.account));
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)

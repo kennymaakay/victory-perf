@@ -215,6 +215,21 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
+Every build, release included, logs three `account` lines every five seconds,
+next to the frame-rate line, from the end of the first second after the first
+present. They cover the whole five seconds: the bytes our
+layer copied up, snapshotted, compared, merged back, sent to or fetched from
+card copies, and read for textures, split by kind of memory (write-watched,
+view, neither) and by side (PC copy, window, card copy, in place); what our
+copies, snapshots, staging and upload memory hold; the process's private
+bytes, working set and page faults; and the ten host copies with the most CPU
+bytes, with how many frames the CPU and the GPU wrote each. A period whose
+refresh copies ran below 200 MB/s is flagged `SLOW (paging?)`.
+
+| Variable | Effect |
+|----------|--------|
+| `VICTORY_ACCOUNT_CSV=<file>` | also appends each period's account to that file as a CSV row (the header is written first when the file is empty) |
+
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
 

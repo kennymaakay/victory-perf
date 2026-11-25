@@ -77,6 +77,8 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Its bytes and writes since the last account ([`crate::account`]).
+    tally: crate::account::Tally,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1417,6 +1419,9 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if let Some(snapshot) = self.before.get_mut().unwrap_or_else(|e| e.into_inner()) {
+            crate::account::snapshot_held(snapshot.capacity(), false);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -1742,6 +1747,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            tally: crate::account::Tally::default(),
         }
     }
 
@@ -1786,6 +1792,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.tally.mark(crate::account::Wrote::Gpu);
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
@@ -1830,7 +1837,11 @@ impl Shadow {
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let snapshot = before.get_or_insert_with(|| pooled(total));
+        let snapshot = before.get_or_insert_with(|| {
+            let snapshot = pooled(total);
+            crate::account::snapshot_held(snapshot.capacity(), true);
+            snapshot
+        });
         if keeps() {
             // Piece by piece, and only the pieces not known current. A
             // piece the part holds whole is current from now on; of a
@@ -1857,11 +1868,13 @@ impl Shadow {
                     unsafe {
                         std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
+                    self.counted(crate::account::Op::Snapshot, hi - lo);
                     kept.0[piece] = whole;
                 }
             }
             return;
         }
+        self.counted(crate::account::Op::Snapshot, taken);
         if wide_back() {
             // Noted, and taken with the submission's other snapshots when
             // its refreshes are done (`take_snapshots`): the range is
@@ -1924,6 +1937,7 @@ impl Shadow {
                 Some(found) => found,
                 None => self.differing(from, to, before),
             };
+            self.counted(crate::account::Op::Differing, differing.iter().map(|&(_, n)| n).sum());
             #[cfg(feature = "diagnostics")]
             let syncing = {
                 use crate::copystat::{C, add};
@@ -1976,6 +1990,7 @@ impl Shadow {
                     written += n;
                 }
             }
+            self.merged(written);
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
             // frame). Asking about the whole range here, to note them
@@ -1990,6 +2005,7 @@ impl Shadow {
     /// Offsets `[from, to)` of the copy are compared with the snapshot: for
     /// the frame line's counts.
     fn compared(&self, from: usize, to: usize) {
+        self.counted(crate::account::Op::Compared, to.saturating_sub(from));
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
         let (bytes, ranges) = if self.window { (2, 5) } else { (3, 6) };
@@ -2030,6 +2046,7 @@ impl Shadow {
         let Some(before) = snapshot.as_mut() else {
             return 0;
         };
+        self.counted(crate::account::Op::Differing, n);
         now.clear();
         now.reserve(n);
         // SAFETY: inside the copy's mapping (checked above), read into
@@ -2062,6 +2079,7 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.merged(n);
         n
     }
 
@@ -2159,6 +2177,7 @@ impl Shadow {
             kept.0.clear();
         }
         if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            crate::account::snapshot_held(bytes.capacity(), false);
             give_back(bytes);
         }
     }
@@ -2315,6 +2334,7 @@ impl Shadow {
                     continue;
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
+                self.counted(crate::account::Op::Under, n);
                 let at = lo - start;
                 if self.card.is_some() {
                     // SAFETY: inside the mapping of the copy's CPU side,
@@ -2368,12 +2388,20 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        let copied = self.update_span(from, to);
+        // After the refresh, which found the memory's kind.
+        self.counted(crate::account::Op::Asked, to.saturating_sub(from));
+        copied
+    }
+
+    /// [`Shadow::update`] of `[from, to)`, cut to the buffer already.
+    fn update_span(&self, from: usize, to: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
         }
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
             return 0;
         }
@@ -2408,10 +2436,13 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        use crate::account::{Mem, Op};
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some((now, written, view)) = crate::watch::writes_kind(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
+                self.tally.set_mem(if view { Mem::View } else { Mem::Watched });
                 let copied = self.copy_stale(from, to, now, &written);
+                self.counted(Op::Copied, copied);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -2421,7 +2452,9 @@ impl Shadow {
                 return copied;
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            self.tally.set_mem(Mem::Neither);
         }
+        self.counted(Op::Whole, to - from);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
@@ -2440,6 +2473,9 @@ impl Shadow {
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
+        // Whether a page the copy had taken was written since: the CPU
+        // wrote the range (for the account; a first copy is no write).
+        let mut rewritten = false;
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -2450,6 +2486,7 @@ impl Shadow {
                 _ => 0,
             };
             let at = &mut copied[page - base];
+            rewritten |= *at != 0 && write > *at;
             if *at == 0 || write > *at {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
@@ -2466,6 +2503,9 @@ impl Shadow {
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
         }
+        if rewritten {
+            self.tally.mark(crate::account::Wrote::Cpu);
+        }
         bytes
     }
 
@@ -2475,7 +2515,9 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        let reading = std::time::Instant::now();
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        crate::account::copy_took(reading.elapsed().as_micros() as u64);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
@@ -2599,6 +2641,7 @@ impl Shadow {
         }
         // The card's side and its "before" take the result.
         self.card_changed(at, at + n);
+        self.merged(written);
         written
     }
 
@@ -2666,8 +2709,74 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.merged(n);
         n
     }
+
+    /// For the account: which side of the host the copy is
+    /// ([`crate::account::Side`]).
+    fn side(&self) -> crate::account::Side {
+        use crate::account::Side;
+        match (self.place.is_some(), self.card.is_some(), self.window) {
+            (true, _, _) => Side::InPlace,
+            (false, true, false) => Side::CardBuffer,
+            (false, true, true) => Side::CardWindow,
+            (false, false, false) => Side::PcBuffer,
+            (false, false, true) => Side::PcWindow,
+        }
+    }
+
+    /// Counts `bytes` of `op` on this copy in the account: by the kind of
+    /// its memory and its side, and in its own tally.
+    pub(crate) fn counted(&self, op: crate::account::Op, bytes: usize) {
+        crate::account::add(op, self.tally.mem(), self.side(), bytes as u64);
+        self.tally.add(op, bytes as u64);
+    }
+
+    /// The merge wrote `bytes` of title memory under this copy.
+    fn merged(&self, bytes: usize) {
+        if bytes != 0 {
+            self.counted(crate::account::Op::Merged, bytes);
+            self.tally.mark(crate::account::Wrote::Merge);
+        }
+    }
+}
+
+/// For the account ([`crate::account`]), once a period: every host copy's
+/// tally taken (title buffers' copies, then windows, each copy once), with
+/// the PC-side bytes of the copies in the tables (card copies' CPU sides
+/// are PC memory too), the snapshot buffers kept for reuse, and the card
+/// sides' bytes. Copies only lists still hold (their buffer released by the
+/// title, their window let go) are not in the tables: their bytes since the
+/// last walk are in the totals by operation, not in the rows.
+pub(crate) fn account_walk() -> crate::account::Walk {
+    let mut walk = crate::account::Walk::default();
+    let mut seen = std::collections::HashSet::new();
+    let mut take = |walk: &mut crate::account::Walk, shadow: &Arc<Shadow>| {
+        if !seen.insert(Arc::as_ptr(shadow) as usize) {
+            return;
+        }
+        if shadow.place.is_none() {
+            if shadow.window {
+                walk.pc_windows += shadow.len;
+            } else {
+                walk.pc_buffers += shadow.len;
+            }
+        }
+        walk.rows.extend(shadow.tally.take(shadow.start, shadow.len, shadow.side()));
+    };
+    for entry in buffers().values() {
+        if let Some(shadow) = &entry.shadow {
+            take(&mut walk, shadow);
+        }
+    }
+    for shadow in LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        take(&mut walk, shadow);
+    }
+    walk.snapshot_pool = POOL.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|v| v.capacity() as u64).sum();
+    walk.card_copies = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
+    walk.card_hashes = CARD_BYTES[1].load(Ordering::Relaxed);
+    walk
 }
 
 struct Entry {

@@ -348,6 +348,7 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < size {
+            crate::account::texture_read_grew(size - read.len());
             read.resize(size, 0);
         }
         f(&mut read[..size])
@@ -401,6 +402,18 @@ pub(crate) fn memory() -> [u64; 3] {
         .as_ref()
         .map_or(0, |map| map.len() as u64);
     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
+}
+
+/// For the account (`crate::account`), in every build: the bytes of the
+/// staging buffers alive.
+pub(crate) fn staged_bytes() -> u64 {
+    STAGED[1].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Counts `bytes` of a texture refresh's `op` on memory of kind `mem` in
+/// the account.
+fn counted(op: crate::account::Op, mem: crate::account::Mem, bytes: usize) {
+    crate::account::add(op, mem, crate::account::Side::Texture, bytes as u64);
 }
 
 /// Staging buffers let go as idle since the start, and their bytes.
@@ -617,6 +630,7 @@ impl Staging {
     }
 
     fn refresh_timed(&self) -> usize {
+        use crate::account::{Mem, Op};
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
@@ -632,6 +646,8 @@ impl Staging {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 self.detile(read);
             });
+            counted(Op::TexRead, Mem::Watched, size);
+            counted(Op::TexDetiled, Mem::Watched, size);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
@@ -647,9 +663,12 @@ impl Staging {
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
-        {
+        // For the account: not write-watched (asked above); a view if the
+        // guards answer, else neither (unknown with the guards off).
+        let guarding = *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"));
+        let mut mem = if guarding { Mem::Neither } else { Mem::Unknown };
+        if guarding && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true)) {
+            mem = Mem::View;
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
@@ -669,7 +688,7 @@ impl Staging {
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
+                return self.refresh_unlocked(last, size, mem);
             };
             mapped
         } else {
@@ -703,16 +722,22 @@ impl Staging {
                 self.detile(read);
                 true
             });
+            counted(Op::TexRead, mem, size);
+            counted(Op::TexHashed, mem, size);
+            if changed {
+                counted(Op::TexDetiled, mem, size);
+            }
             #[cfg(feature = "diagnostics")]
             if changed {
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
             }
-            let _ = changed;
             return size;
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
+                counted(Op::TexRead, mem, size);
+                counted(Op::TexHashed, mem, size);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -720,6 +745,7 @@ impl Staging {
                 }
                 last.hash = Some(hash);
                 self.detile(tiled);
+                counted(Op::TexDetiled, mem, size);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -729,6 +755,8 @@ impl Staging {
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
+        counted(Op::TexRead, mem, size);
+        counted(Op::TexHashed, mem, size);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -736,6 +764,7 @@ impl Staging {
         }
         last.hash = Some(hash);
         self.detile(tiled);
+        counted(Op::TexDetiled, mem, size);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -746,17 +775,21 @@ impl Staging {
     /// is not there at this moment. Then nothing is taken and the texture
     /// is looked at again at its next refresh (what was learnt about writes
     /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
+    /// Returns the bytes read; `mem` is the memory's kind, for the account.
+    fn refresh_unlocked(&self, last: &mut Last, size: usize, mem: crate::account::Mem) -> usize {
+        use crate::account::Op;
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
             let hash = blake3::hash(read);
+            counted(Op::TexRead, mem, size);
+            counted(Op::TexHashed, mem, size);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
+                counted(Op::TexDetiled, mem, size);
             }
             true
         });
