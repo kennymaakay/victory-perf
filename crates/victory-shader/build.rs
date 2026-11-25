@@ -42,16 +42,25 @@ fn main() {
         .collect();
     named.sort();
     let mut h = blake3::Hasher::new();
+    let mut text = String::new();
     for (rel, path) in &named {
         let bytes = std::fs::read(path).expect("a translator source file reads");
         h.update(rel.as_bytes());
         h.update(&[0]);
         h.update(&(bytes.len() as u64).to_le_bytes());
         h.update(&bytes);
+        text.push_str(&String::from_utf8_lossy(&bytes));
     }
-    // Features can change what a translation is (`diagnostics` keeps more).
+    // A feature can change what a translation is, but only one the sources test: an unused
+    // one (`diagnostics` has no `cfg` in src today) would only make a diagnostics build of
+    // the same translator miss every cached translation.
     let mut features: Vec<String> = std::env::vars()
         .filter_map(|(k, _)| k.strip_prefix("CARGO_FEATURE_").map(str::to_owned))
+        .filter(|f| {
+            let name = f.to_lowercase();
+            let dashed = name.replace('_', "-");
+            text.contains(&format!("feature = \"{name}\"")) || text.contains(&format!("feature = \"{dashed}\""))
+        })
         .collect();
     features.sort();
     for f in &features {
