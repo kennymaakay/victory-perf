@@ -1719,6 +1719,188 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// A constant buffer view of a table made on a copy in the card's
+    /// memory, or filled as a `Fill` after all ([`place_constants`]).
+    Constant(Box<Constant>),
+}
+
+/// A constant buffer view of a table made on a title buffer's copy in the
+/// card's memory (`crate::draw`'s `cbv_on_card`), and the fill of the
+/// list's upload memory it falls back to where a submission cannot read it
+/// there ([`place_constants`]).
+pub(crate) struct Constant {
+    /// The copy the view is made on.
+    pub(crate) shadow: std::sync::Arc<crate::shadow::Shadow>,
+    /// The view's title memory: address, bytes.
+    pub(crate) address: usize,
+    pub(crate) len: usize,
+    /// The list's upload memory filled instead (CPU address).
+    pub(crate) to: usize,
+    /// Makes the view again, on the upload memory.
+    pub(crate) remake: Box<dyn Fn() + Send>,
+    /// Whether the view is on the upload memory now.
+    pub(crate) filled: std::sync::atomic::AtomicBool,
+    /// Whether a submission placed it already ([`place_constants`]).
+    pub(crate) placed: std::sync::atomic::AtomicBool,
+}
+
+/// Whether a constant buffer view of a table made on copy `copy` (title
+/// memory `[from, to)`) is filled instead in a submission
+/// ([`place_constants`]): `ran`, a step of ours in it may write title
+/// memory anywhere; `copied`, the title's buffer copies into title memory
+/// in it (in order, joined); `shaders_write`, its shaders write the copy;
+/// `flights`, per copy (its number) the title memory the shaders of
+/// flights in the air may write (in order, joined).
+fn constant_filled(
+    from: usize,
+    to: usize,
+    copy: u64,
+    ran: bool,
+    copied: &[(usize, usize)],
+    shaders_write: bool,
+    flights: &[(u64, Vec<(usize, usize)>)],
+) -> bool {
+    ran || shaders_write
+        || touches(copied, from, to)
+        || flights.iter().any(|(c, ranges)| *c != copy && touches(ranges, from, to))
+}
+
+/// At each submission: which constant buffer views of tables made on
+/// copies in the card's memory (`Step::Constant`) are filled instead, as
+/// the views that are not made there are, and their views made again to
+/// match (`Step::Constant` then fills in order with the other steps and
+/// is waited for as a `Fill`). Filled when, in the submission:
+///
+/// - the title copies into the view's memory (`Step::Copy`), or a step of
+///   ours may write title memory anywhere (`Step::Run`): the copy holds one
+///   version of its bytes per submission, every refresh going up together
+///   ahead of the lists (`Host::card_before`), so a draw recorded before
+///   the copy would read the bytes from after it; and a refresh under a
+///   range the submission's shaders write leaves the copy's bytes there
+///   alone (`Shadow::update`). The fill runs in order with the copies.
+/// - its shaders write the copy: its buffer is promoted to unordered
+///   access in the submission's one `ExecuteCommandLists`, and is not
+///   promoted again to a constant buffer read (nor the other way round)
+///   without a transition the title's lists do not have.
+/// - a flight in the air may write the view's memory through another copy
+///   (a title buffer around this one, or inside it): this copy has none of
+///   what it writes; the fill waits for it (`WHY_READ`).
+fn place_constants(runs: &[&HostList]) {
+    let mut any = false;
+    let mut ran = false;
+    let mut copied = Vec::new();
+    let mut written = std::collections::HashSet::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                &Step::Copy(dst, _, len) => copied.push((dst, dst + len)),
+                Step::Run(_) => ran = true,
+                Step::GpuWrite(shadow, ..) => {
+                    written.insert(shadow.id());
+                }
+                Step::Constant(_) => any = true,
+                _ => {}
+            }
+        }
+    }
+    if !any {
+        return;
+    }
+    join_ranges(&mut copied, []);
+    let flights = {
+        let line = line();
+        let mut per_copy: Vec<(u64, Vec<(usize, usize)>)> = Vec::new();
+        for d in line.declared.iter().flat_map(|(_, d)| d.iter()) {
+            match per_copy.iter_mut().find(|(c, _)| *c == d.copy) {
+                Some((_, ranges)) => ranges.push((d.from, d.to)),
+                None => per_copy.push((d.copy, vec![(d.from, d.to)])),
+            }
+        }
+        per_copy
+    };
+    let flights: Vec<_> = flights
+        .into_iter()
+        .map(|(c, mut ranges)| {
+            join_ranges(&mut ranges, []);
+            (c, ranges)
+        })
+        .collect();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Constant(c) = step {
+                // Placed at the list's first submission only: a list run
+                // again without a reset gave its tables' slots back
+                // (`crate::draw`'s `State::tables_done`), others may hold
+                // them now. shortcut: it stays as it was placed.
+                if c.placed.swap(true, Ordering::Relaxed) {
+                    if c.filled.load(Ordering::Relaxed) {
+                        crate::draw::TABLE_CBVS[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                let copy = c.shadow.id();
+                let fill = constant_filled(
+                    c.address,
+                    c.address + c.len,
+                    copy,
+                    ran,
+                    &copied,
+                    written.contains(&copy),
+                    &flights,
+                );
+                if fill {
+                    crate::draw::TABLE_CBVS[2].fetch_add(1, Ordering::Relaxed);
+                }
+                if fill {
+                    c.filled.store(true, Ordering::Relaxed);
+                    (c.remake)();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod constant_tests {
+    use super::constant_filled;
+
+    const VIEW: (usize, usize) = (0x2929_fd00, 0x2929_fd00 + 480);
+
+    /// The measured case: a flight declared the whole buffer written
+    /// through the view's own copy, and nothing else: made on the copy.
+    #[test]
+    fn a_flight_writing_the_views_own_copy_keeps_it_on_the_copy() {
+        let flights = [(1, vec![(0x2860_0000, 0x2860_0000 + 182_452_224)])];
+        assert!(!constant_filled(VIEW.0, VIEW.1, 1, false, &[], false, &flights));
+        assert!(!constant_filled(VIEW.0, VIEW.1, 1, false, &[], false, &[]));
+    }
+
+    /// Through another copy (a buffer around or inside it): filled, and
+    /// waited for; another copy's writes elsewhere do not count.
+    #[test]
+    fn a_flight_writing_it_through_another_copy_fills_it() {
+        let around = [(1, vec![(0x2860_0000, 0x3000_0000)]), (2, vec![(0x2929_0000, 0x292a_0000)])];
+        assert!(constant_filled(VIEW.0, VIEW.1, 2, false, &[], false, &around));
+        let elsewhere = [(1, vec![(0x1000, 0x2000), (VIEW.1, VIEW.1 + 256)])];
+        assert!(!constant_filled(VIEW.0, VIEW.1, 2, false, &[], false, &elsewhere));
+    }
+
+    /// A title copy into the view's memory, or a step of ours anywhere, in
+    /// the submission: filled in order with them. A copy next to it is not.
+    #[test]
+    fn copies_into_it_and_steps_of_ours_fill_it() {
+        assert!(constant_filled(VIEW.0, VIEW.1, 1, false, &[(VIEW.0 + 16, VIEW.0 + 32)], false, &[]));
+        assert!(!constant_filled(VIEW.0, VIEW.1, 1, false, &[(VIEW.1, VIEW.1 + 64)], false, &[]));
+        assert!(!constant_filled(VIEW.0, VIEW.1, 1, false, &[(VIEW.0 - 64, VIEW.0)], false, &[]));
+        assert!(constant_filled(VIEW.0, VIEW.1, 1, true, &[], false, &[]));
+    }
+
+    /// The submission's shaders write the copy (anywhere: the buffer's
+    /// state is the whole buffer's): filled.
+    #[test]
+    fn shaders_of_the_submission_writing_the_copy_fill_it() {
+        assert!(constant_filled(VIEW.0, VIEW.1, 1, false, &[], true, &[]));
+    }
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2315,6 +2497,14 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 }
                 &Step::Fill(_, src, len) => {
                     if touches(written, src, src + len) {
+                        if count {
+                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Some(WHY_READ);
+                    }
+                }
+                Step::Constant(c) => {
+                    if c.filled.load(Ordering::Relaxed) && touches(written, c.address, c.address + c.len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2938,6 +3128,9 @@ fn reads(runs: &[&HostList]) -> (Vec<(crate::cause::Read, usize, usize)>, bool) 
                     out.push((Read::Copy, dst, dst + len));
                 }
                 &Step::Fill(_, src, len) => out.push((Read::Fill, src, src + len)),
+                Step::Constant(c) if c.filled.load(Ordering::Relaxed) => {
+                    out.push((Read::Fill, c.address, c.address + c.len));
+                }
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
                     out.push((Read::Texture, at, at + len));
@@ -4392,6 +4585,9 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        // Before anything looks at what the lists read on the CPU: the
+        // constant buffer views made on copies that are filled after all.
+        place_constants(runs);
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -5428,6 +5624,29 @@ impl HostList {
             .push(Step::Fill(dst as usize, src as usize, len));
     }
 
+    /// A constant buffer view of a table, `len` bytes of title memory at
+    /// `address`, made on `shadow`'s copy in the card's memory; or, if a
+    /// submission decides so ([`place_constants`]), filled into the list's
+    /// upload memory at `dst` and made again there by `remake`.
+    pub(crate) fn defer_constant(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+        dst: *mut u8,
+        remake: impl Fn() + Send + 'static,
+    ) {
+        self.deferred().copies.push(Step::Constant(Box::new(Constant {
+            shadow: shadow.clone(),
+            address,
+            len,
+            to: dst as usize,
+            remake: Box::new(remake),
+            filled: std::sync::atomic::AtomicBool::new(false),
+            placed: std::sync::atomic::AtomicBool::new(false),
+        })));
+    }
+
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.
@@ -5674,6 +5893,25 @@ impl HostList {
                         len as u64,
                     );
                     len
+                }
+                Step::Constant(c) => {
+                    // Made on the copy: nothing to do here.
+                    if !c.filled.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Copies, 1);
+                        add(C::CopyBytes, c.len as u64);
+                    }
+                    copy_mapped(c.to as *mut u8, c.address as *const u8, c.len, false);
+                    crate::account::add(
+                        crate::account::Op::StepFill,
+                        crate::account::Mem::Unknown,
+                        crate::account::Side::Direct,
+                        c.len as u64,
+                    );
+                    c.len
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -6330,6 +6568,9 @@ impl Meter {
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
+        // Constant buffer views of tables made on those copies, those of
+        // them filled at a submission after all, and those filled.
+        let table_cbvs = [0, 1, 2].map(|i| crate::draw::TABLE_CBVS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
@@ -6377,7 +6618,10 @@ impl Meter {
                 tracing::info!(
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
-                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
+                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms); constant buffer views of tables: \
+                     {:.0} made on these copies (VICTORY_CBV_DIRECT=0: none), {:.0} of them filled at a submission \
+                     after all (a title copy or a step of ours there, the copy's own shader writes, a flight writing \
+                     it through another copy), {:.0} filled from title memory",
                     card[7],
                     card[8] >> 20,
                     card[9] >> 20,
@@ -6387,7 +6631,10 @@ impl Meter {
                     per_frame(3),
                     per_frame(4) / 1e6,
                     per_frame(5),
-                    per_frame(6) / 1e3
+                    per_frame(6) / 1e3,
+                    table_cbvs[0],
+                    table_cbvs[2],
+                    table_cbvs[1]
                 );
             }
             tracing::info!(

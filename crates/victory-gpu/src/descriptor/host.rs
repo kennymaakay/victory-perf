@@ -1296,19 +1296,18 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory (the list's own, which it holds).
+    /// memory (the list's own, which it holds, or a host copy its refresh
+    /// holds: `crate::draw`'s `cbv_on_card`).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
-        let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
-        };
-        // SAFETY: a slot of our heap; the memory is the caller's.
-        unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
-        };
+        constant_view(self.cpu(index).ptr, gpu, size);
+    }
+
+    /// The CPU handle of slot `index`, for [`constant_view`] later and
+    /// from any thread: the heap is the caller's to keep alive (a list
+    /// holds the heaps it names).
+    pub(crate) fn slot_handle(&self, index: u32) -> usize {
+        self.cpu(index).ptr
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -2265,6 +2264,23 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+    };
+}
+
+/// Makes the slot at CPU handle `at` ([`HostHeap::slot_handle`]) a
+/// constant buffer view of `size` bytes of host memory at `gpu` (rounded
+/// up to 256), as [`HostHeap::constant_at`] does, leaving what the slot
+/// holds alive as it is: the memory is the caller's.
+pub(crate) fn constant_view(at: usize, gpu: u64, size: u32) {
+    let Some(host) = host() else { return };
+    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+        BufferLocation: gpu,
+        SizeInBytes: size.next_multiple_of(256),
+    };
+    // SAFETY: a slot of a live heap of ours; the memory is the caller's.
+    unsafe {
+        host.device
+            .CreateConstantBufferView(Some(&desc), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at })
     };
 }
 
