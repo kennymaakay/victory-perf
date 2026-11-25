@@ -79,6 +79,10 @@ pub(crate) struct Shadow {
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
     /// Its bytes and writes since the last account ([`crate::account`]).
     tally: crate::account::Tally,
+    /// Of a copy in the card's memory: offsets of the copy whose title
+    /// memory our merges wrote since [`Shadow::merges_noted`] last looked
+    /// ([`echo`]).
+    merges: Mutex<Vec<(usize, usize)>>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -618,6 +622,265 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
         out.push((at, to));
     }
     out
+}
+
+/// Whether what our merges write into title memory under a copy in the
+/// card's memory goes back up to that copy at the next refresh, as it did
+/// (`VICTORY_ECHO=1`; off by default).
+///
+/// The merge puts what shaders wrote into title memory and into the copy's
+/// CPU side; the card's side holds those bytes already. But our write is a
+/// write to the write watch (and opens the guards of view memory), so the
+/// next refresh found the pages written, copied them in again and sent
+/// them up: measured with the account on the 2080 SUPER, relay on, one
+/// 94 MB card buffer was sent up 404 MB in 23 frames, 402 MB of it what
+/// the merges had written there, and some 78 MB a frame went up overall,
+/// about what was merged and found differing.
+///
+/// A dirty bit says that a page was written, not by whom, and asking
+/// resets it for the whole page: our bytes cannot be taken out of the
+/// answer when the title wrote the page too. So after the merges
+/// ([`Shadow::merges_noted`]) the pages they wrote are asked about at once
+/// ([`crate::watch::writes_now`]: the kernel or the guards, never the
+/// journal of an earlier asking), and each such page's title bytes, read
+/// after that asking, are compared with the CPU side's. A page that holds
+/// the same bytes is noted taken at that asking; any other stays as it
+/// was.
+///
+/// Why no title write is lost:
+///
+/// - one before the asking (in the flight, or while the merge ran) is in
+///   the bytes compared: a page it changed differs, keeps its old stamp
+///   and is copied and sent up as before; one that left the bytes as they
+///   were has nothing to send;
+/// - one after the asking sets the page's bit again (or faults on its
+///   guard), and a later asking notes it with a higher number than the
+///   stamp: copied as before;
+/// - the CPU side's bytes not yet on the card are in its `dirty` ranges,
+///   which go up whatever the stamps say, or went up already (`sent`).
+///
+/// The askings number in time order ([`crate::watch::ask_once`] holds the
+/// journal across its own), and a stamp is never lowered here, so a noted
+/// page means what a refresh's copy means: the CPU side held title memory
+/// as it was after that asking. Copies in the PC's memory are left as
+/// they are: their merge writes the copy itself, and the echo there is a
+/// copy on the CPU, not a send.
+pub(crate) fn echo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ECHO").is_some_and(|v| v == "1"))
+}
+
+/// Pages apart by at most this are asked about together after the merges
+/// ([`asking_runs`]): an asking costs tens of microseconds whatever its
+/// length, as for [`crate::watch::ask_ahead`].
+const ECHO_GAP: usize = (8 << 20) / PAGE;
+/// The most pages one such asking covers.
+const ECHO_MOST: usize = (256 << 20) / PAGE;
+
+/// The title pages (numbered from address 0) that hold offsets `spans` of
+/// a copy of title memory from `start` on: in order, each once.
+fn merged_pages(start: usize, spans: &[(usize, usize)]) -> Vec<usize> {
+    let mut pages: Vec<usize> =
+        spans.iter().filter(|s| s.0 < s.1).flat_map(|&(a, b)| (start + a) / PAGE..(start + b).div_ceil(PAGE)).collect();
+    pages.sort_unstable();
+    pages.dedup();
+    pages
+}
+
+/// Runs of pages `[first, last)` to ask about together for `pages` (in
+/// order): pages at most `gap` apart share a run, up to [`ECHO_MOST`]
+/// pages long. Every page is in one run.
+fn asking_runs(pages: &[usize], gap: usize) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for &page in pages {
+        match out.last_mut() {
+            Some(last) if page <= last.1 + gap && page + 1 - last.0 <= ECHO_MOST => last.1 = last.1.max(page + 1),
+            _ => out.push((page, page + 1)),
+        }
+    }
+    out
+}
+
+/// Whether a page stamped `stamp` may be noted taken at asking `now`: the
+/// CPU side holds `held` there and title memory, read after that asking,
+/// holds `title`. Never lowers a stamp.
+fn current_at(stamp: u64, now: u64, held: &[u8], title: &[u8]) -> bool {
+    stamp < now && held == title
+}
+
+/// The walk of [`Shadow::merges_noted`] over `pages` of a copy of title
+/// memory `[start, end)`: `ask(lo, hi)` asks about a run's bytes and gives
+/// the asking's number (`None`: not watched, its pages are left as they
+/// are); `note(page, lo, hi, now)` then looks at each page's bytes in the
+/// copy and says whether it noted them. Returns the bytes noted.
+fn note_merged(
+    start: usize,
+    end: usize,
+    pages: &[usize],
+    mut ask: impl FnMut(usize, usize) -> Option<u64>,
+    mut note: impl FnMut(usize, usize, usize, u64) -> bool,
+) -> usize {
+    let mut noted = 0;
+    let mut next = 0;
+    for (first, last) in asking_runs(pages, ECHO_GAP) {
+        let mine = pages[next..].iter().take_while(|&&p| p < last).count();
+        let run = &pages[next..next + mine];
+        next += mine;
+        let (lo, hi) = ((first * PAGE).max(start), (last * PAGE).min(end));
+        if lo >= hi {
+            continue;
+        }
+        let Some(now) = ask(lo, hi) else {
+            continue;
+        };
+        for &page in run {
+            let (lo, hi) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+            if lo < hi && note(page, lo, hi, now) {
+                noted += hi - lo;
+            }
+        }
+    }
+    noted
+}
+
+#[cfg(test)]
+mod echo_tests {
+    use super::{ECHO_GAP, ECHO_MOST, PAGE, asking_runs, current_at, merge_piece, merged_pages, note_merged};
+
+    #[test]
+    fn merged_spans_name_each_page_once() {
+        let start = 3 * PAGE + 0x100;
+        // Two spans in one page, one across two, one empty.
+        let spans = [(0, 16), (0x200, 0x300), (PAGE - 0x100 - 8, PAGE - 0x100 + 8), (50, 50)];
+        assert_eq!(merged_pages(start, &spans), [3, 4]);
+        assert_eq!(merged_pages(0, &[(5 * PAGE, 5 * PAGE + 1), (PAGE, 2 * PAGE)]), [1, 5]);
+        assert!(merged_pages(start, &[]).is_empty());
+    }
+
+    #[test]
+    fn asking_runs_hold_every_page_once() {
+        let pages = [1, 2, 3, 3 + ECHO_GAP, 5 + 2 * ECHO_GAP, 10_000];
+        let runs = asking_runs(&pages, ECHO_GAP);
+        assert_eq!(runs, [(1, 4 + ECHO_GAP), (5 + 2 * ECHO_GAP, 6 + 2 * ECHO_GAP), (10_000, 10_001)]);
+        for page in pages {
+            assert_eq!(runs.iter().filter(|r| r.0 <= page && page < r.1).count(), 1, "page {page}");
+        }
+        // A long stretch is cut.
+        let long: Vec<usize> = (0..ECHO_MOST + 5).collect();
+        assert_eq!(asking_runs(&long, ECHO_GAP), [(0, ECHO_MOST), (ECHO_MOST, ECHO_MOST + 5)]);
+        assert!(asking_runs(&[], ECHO_GAP).is_empty());
+    }
+
+    /// Only a page whose title bytes are the CPU side's is noted, and a
+    /// stamp from the same or a later asking is kept.
+    #[test]
+    fn a_page_is_noted_only_when_it_holds_the_copys_bytes() {
+        let held = vec![7u8; 64];
+        let mut title = held.clone();
+        assert!(current_at(10, 11, &held, &title));
+        assert!(!current_at(11, 11, &held, &title), "already taken at this asking");
+        assert!(!current_at(12, 11, &held, &title), "never lowered");
+        title[63] = 8;
+        assert!(!current_at(10, 11, &held, &title), "the title changed a byte");
+    }
+
+    /// The walk asks once per run, each page under its run's asking, and
+    /// cuts pages to the copy.
+    #[test]
+    fn the_walk_asks_per_run_and_cuts_pages_to_the_copy() {
+        let (start, end) = (2 * PAGE + 100, 40 * PAGE + 7);
+        let pages = [2, 3, 20, 40];
+        let mut asks = Vec::new();
+        let mut seen = Vec::new();
+        let noted = note_merged(
+            start,
+            end,
+            &pages,
+            |lo, hi| {
+                asks.push((lo, hi));
+                Some(asks.len() as u64)
+            },
+            |page, lo, hi, now| {
+                seen.push((page, lo, hi, now));
+                page != 20
+            },
+        );
+        assert_eq!(asks, [(start, end)], "one run: the pages lie within the gap");
+        assert_eq!(seen, [(2, start, 3 * PAGE, 1), (3, 3 * PAGE, 4 * PAGE, 1), (20, 20 * PAGE, 21 * PAGE, 1), (40, 40 * PAGE, end, 1)]);
+        assert_eq!(noted, (3 * PAGE - start) + PAGE + (end - 40 * PAGE));
+        // Memory not watched: nothing is looked at.
+        let noted = note_merged(start, end, &pages, |_, _| None, |_, _, _, _| panic!("looked at"));
+        assert_eq!(noted, 0);
+    }
+
+    /// A model of a copy in the card's memory over two pages: the card's
+    /// side, the CPU side, title memory, the copy's stamps, and per page
+    /// the kernel's dirty bit and the journal's last write. A flight wrote
+    /// both pages on the card; the title wrote page 1 during the flight.
+    /// The merge brings the card's bytes in; the check notes page 0 only,
+    /// so page 1 still goes up, and a title write after the check is
+    /// found by the next asking.
+    #[test]
+    fn our_merged_bytes_stay_down_and_the_titles_go_up() {
+        let base: Vec<u8> = (0..2 * PAGE as u32).map(|i| (i % 251) as u8).collect();
+        let (mut card, mut cpu, mut title) = (base.clone(), base.clone(), base.clone());
+        let mut stamps = [5u64, 5];
+        let mut journal = [0u64; 2];
+        let mut dirty = [false; 2];
+        let mut asked = 5u64;
+        let mut ask = |journal: &mut [u64; 2], dirty: &mut [bool; 2]| {
+            asked += 1;
+            for page in 0..2 {
+                if std::mem::take(&mut dirty[page]) {
+                    journal[page] = asked;
+                }
+            }
+            asked
+        };
+        // The flight: shaders write in both pages on the card.
+        for at in (4..8).chain(PAGE + 4..PAGE + 8) {
+            card[at] = 0xa0;
+        }
+        // The title writes page 1 during the flight.
+        title[PAGE + 20] = 0x77;
+        dirty[1] = true;
+        // The landing merges what the card wrote: our writes set page 0's
+        // bit too (page 1's is set already).
+        assert!(merge_piece(&card, &mut cpu, &mut title));
+        dirty[0] = true;
+        let noted = note_merged(
+            0,
+            2 * PAGE,
+            &[0, 1],
+            |_, _| Some(ask(&mut journal, &mut dirty)),
+            |page, lo, hi, now| {
+                let current = current_at(stamps[page], now, &cpu[lo..hi], &title[lo..hi]);
+                if current {
+                    stamps[page] = now;
+                }
+                current
+            },
+        );
+        assert_eq!(noted, PAGE);
+        assert_eq!(stamps, [6, 5]);
+        // The next refresh: page 0 is current, page 1 is stale and goes up
+        // with the title's byte.
+        let stale: Vec<usize> = (0..2).filter(|&p| journal[p] > stamps[p]).collect();
+        assert_eq!(stale, [1]);
+        for page in stale {
+            let (lo, hi) = (page * PAGE, (page + 1) * PAGE);
+            cpu[lo..hi].copy_from_slice(&title[lo..hi]);
+            card[lo..hi].copy_from_slice(&cpu[lo..hi]);
+        }
+        assert_eq!(card, title);
+        assert_eq!(cpu, title);
+        // The title writes page 0 after the check: the next asking notes
+        // it above the stamp, and it goes up then.
+        title[1] = 0x55;
+        dirty[0] = true;
+        let now = ask(&mut journal, &mut dirty);
+        assert!(journal[0] == now && journal[0] > stamps[0]);
+    }
 }
 
 #[cfg(test)]
@@ -1759,6 +2022,7 @@ impl Shadow {
             window: false,
             place: None,
             tally: crate::account::Tally::default(),
+            merges: Mutex::default(),
         }
     }
 
@@ -2503,7 +2767,13 @@ impl Shadow {
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
+                    // A page noted written by an asking after this one
+                    // (while a submission's one asking stands: our own
+                    // writes, `crate::watch::wrote` and `writes_now`) is
+                    // copied after that asking too. Noting the lower
+                    // number had every later refresh of the submission
+                    // copy it again.
+                    *at = if echo() { now } else { now.max(write) };
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
@@ -2644,6 +2914,7 @@ impl Shadow {
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
+                self.merges.lock().unwrap_or_else(|e| e.into_inner()).push((at, at + n));
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
@@ -2720,8 +2991,62 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.merges.lock().unwrap_or_else(|e| e.into_inner()).push((at, at + n));
         self.merged(n);
         n
+    }
+
+    /// After merges into title memory under a copy in the card's memory
+    /// ([`Shadow::card_merge`], [`Shadow::card_merge_relay`]), on the
+    /// thread that merged: the pages they wrote are asked about once more
+    /// ([`crate::watch::writes_now`]), and each whose title bytes, read
+    /// after that asking, are the CPU side's bytes is noted taken at it, so
+    /// that no refresh copies it in and sends it back up to the card
+    /// ([`echo`] says why this is safe). Returns the bytes noted.
+    pub(crate) fn merges_noted(&self) -> usize {
+        let spans = std::mem::take(&mut *self.merges.lock().unwrap_or_else(|e| e.into_inner()));
+        if spans.is_empty() || self.card.is_none() || echo() || self.unwatched() {
+            return 0;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        let pages = merged_pages(start, &spans);
+        let mut title = vec![0u8; PAGE];
+        let noted = note_merged(start, end, &pages, |lo, hi| crate::watch::writes_now(lo, hi).map(|(now, _)| now), |page, lo, hi, now| {
+            let n = hi - lo;
+            // Every write of the CPU side is under one of these two locks:
+            // refreshes hold the stamps' (`copy_stale`), the merges and the
+            // title's bytes put in under shader writes the reference's
+            // (`card_merge_relay`, `merge_under_writes`). `card_merge`
+            // takes neither, which holds only because its one caller
+            // (`crate::host`'s `card_back`) never runs while the relay's
+            // landing thread does (with the relay a settle only waits for
+            // that thread), and waits for its merges before it calls this.
+            // A new caller of it must keep that, or the compare races it.
+            // What is compared stays as it is.
+            let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(at) = copied.get_mut(page - base) else {
+                return false;
+            };
+            if *at >= now {
+                return false;
+            }
+            let title = &mut title[..n];
+            if !crate::host::read_into(lo as *const u8, title) {
+                return false;
+            }
+            // SAFETY: inside the mapping of the CPU side (`lo..hi` lies in
+            // the copy), which no one writes while the locks are held.
+            let held = unsafe { std::slice::from_raw_parts(self.data.add(lo - start), n) };
+            if !current_at(*at, now, held, title) {
+                return false;
+            }
+            *at = now;
+            true
+        });
+        self.counted(crate::account::Op::EchoSkipped, noted);
+        noted
     }
 
     /// For the account: which side of the host the copy is

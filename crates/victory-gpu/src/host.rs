@@ -3722,11 +3722,16 @@ impl Host {
         let beside = copy_queue.is_some() && ran_beside > landed.0;
         let mut title = Vec::new();
         let mut written = 0;
+        let mut merged_into: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for (shadow, lo, hi, at) in pieces {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
             let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(lo, gpu, after, &mut title);
+            let wrote = shadow.card_merge_relay(lo, gpu, after, &mut title);
+            written += wrote;
+            if wrote > 0 && !merged_into.iter().any(|s| Arc::ptr_eq(s, &shadow)) {
+                merged_into.push(shadow.clone());
+            }
             // Every such stretch, not only those whose bytes the CPU's
             // side took: a half-done read can also hide a write, where the
             // later flight had put back for the moment the bytes the CPU's
@@ -3736,6 +3741,11 @@ impl Host {
             if beside {
                 f.unsure.push((shadow, lo, hi, ran_beside));
             }
+        }
+        // What the merges wrote is not sent back up to the copies it came
+        // from (`crate::shadow::echo`).
+        for shadow in merged_into {
+            shadow.merges_noted();
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
@@ -3992,6 +4002,13 @@ impl Host {
                     let gpu = unsafe { std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo) };
                     written[i] += plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
                 }
+            }
+            // What the merges wrote goes up once, with the CPU side's
+            // changed ranges, and not again at the next refresh
+            // (`crate::shadow::echo`). A copy listed twice is looked at
+            // once: the first call takes its spans, the next finds none.
+            for r in &plan.ranges {
+                r.shadow.merges_noted();
             }
         }
         for (r, written) in plan.ranges.iter().zip(written) {

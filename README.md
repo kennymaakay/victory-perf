@@ -77,7 +77,8 @@ Upstream caps card copies at 1024 MB; here the cap is 1280 because at 768 it
 was full on an 8 GB card and the CPU still compared 142 MB a frame, while at
 1280 the copies took 941 MB. The timing run (`VICTORY_GPU_TIMING`) turns the
 late wait and the relay off, and `VICTORY_INPLACE=2` does too unless
-`VICTORY_LATE_WAIT` or `VICTORY_RELAY` is set. Other newer speed changes sit
+`VICTORY_LATE_WAIT` is set or the relay is asked for (`VICTORY_RELAY=1` or
+`2`, without `VICTORY_KEEP_SNAPSHOTS=1`). Other newer speed changes sit
 behind switches that are off by default (`VICTORY_INPLACE`,
 `VICTORY_BVH_BUILDER`, ...). Each is described in a comment where it is
 read.

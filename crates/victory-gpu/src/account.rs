@@ -69,9 +69,14 @@ pub(crate) enum Op {
     StepCopy,
     /// Our own fills of upload memory from title memory (`Step::Fill`).
     StepFill,
+    /// Of pages our merges wrote under card copies: found holding the
+    /// copy's bytes right after, and noted current, so that no refresh
+    /// copies them in and sends them back up (`crate::shadow::echo`;
+    /// `VICTORY_ECHO=1` sends them, and this stays 0).
+    EchoSkipped,
 }
 
-pub(crate) const OPS: usize = 15;
+pub(crate) const OPS: usize = 16;
 const OP_ALL: [Op; OPS] = [
     Op::Asked,
     Op::Copied,
@@ -88,6 +93,7 @@ const OP_ALL: [Op; OPS] = [
     Op::TexDetiled,
     Op::StepCopy,
     Op::StepFill,
+    Op::EchoSkipped,
 ];
 
 impl Op {
@@ -108,6 +114,7 @@ impl Op {
             Op::TexDetiled => "tex_detiled",
             Op::StepCopy => "step_copy",
             Op::StepFill => "step_fill",
+            Op::EchoSkipped => "echo_skipped",
         }
     }
 }
@@ -115,7 +122,8 @@ impl Op {
 /// The kind of title memory: as the write watch and the guards found it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Mem {
-    /// Not asked yet (or not asked at all: our own copies and fills).
+    /// Not asked yet (or not asked at all: our own copies and fills, and
+    /// texture reads made without asking, such as the heap recheck's).
     Unknown = 0,
     /// Write-watched memory (the kernel's dirty bits).
     Watched = 1,

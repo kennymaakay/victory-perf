@@ -72,6 +72,11 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    ask_ahead_in(&mut JOURNAL.lock().unwrap_or_else(|e| e.into_inner()), ranges);
+}
+
+/// [`ask_ahead`] with the journal's lock held by the caller.
+fn ask_ahead_in(j: &mut Journal, ranges: &[(usize, usize)]) {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
@@ -81,8 +86,6 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
     if j.kept {
@@ -172,10 +175,20 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
-    ask_once_end();
-    ask_ahead(ranges);
+    // All of it under one hold of the lock: the lone ranges' findings below
+    // are numbered with the ahead asking's number, and an asking made on
+    // another thread in between ([`writes_now`], after the relay's merges)
+    // would have a higher one. A page it found written, and the title
+    // wrote again before the lone asking, would go back to the lower
+    // number in the journal, and a copy noted current at the higher one
+    // would miss the title's write.
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    if j.kept {
+        j.kept = false;
+        j.ahead.clear();
+    }
+    ask_ahead_in(j, ranges);
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
         j.asked += 1;
@@ -308,6 +321,26 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// (true) or from write watching (false): for the account's kinds of
 /// memory (`crate::account`). The answer is the same as `writes`'.
 pub(crate) fn writes_kind(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>, bool)> {
+    writes_asked(start, end, guarded, true)
+}
+
+/// [`writes`] of `[start, end)` (guarded view memory included), asked of
+/// the kernel or the guards now even where an asking made ahead
+/// ([`ask_ahead`], [`ask_once`]) holds the range: for our own writes into
+/// title memory on another thread than the submitting one (the relay's
+/// merges into copies in the card's memory, `crate::shadow`), which no
+/// asking made before them has seen. The pages they wrote are noted
+/// written at this asking's number, which is higher than any before it,
+/// and their dirty bits (or guards) are reset: a write after this asking
+/// is found by a later one. While a submission's one asking stands, the
+/// journal then holds pages written after it, as [`wrote`] leaves it.
+pub(crate) fn writes_now(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_asked(start, end, true, false).map(|(now, written, _)| (now, written))
+}
+
+/// [`writes_kind`]; `ahead`: whether an asking made ahead that holds the
+/// range may answer from the journal.
+fn writes_asked(start: usize, end: usize, guarded: bool, ahead: bool) -> Option<(u64, Vec<(usize, u64)>, bool)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -315,7 +348,7 @@ pub(crate) fn writes_kind(start: usize, end: usize, guarded: bool) -> Option<(u6
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     // (Only write-watched ranges are asked ahead: `ask_kernel`.)
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if ahead && j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
             j.ahead_asked,
             j.written
@@ -764,6 +797,55 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// While a submission's one asking stands, `writes` answers from it and
+    /// does not see a later write; `writes_now` asks the kernel, notes the
+    /// page above the standing asking and resets its bit, and a write after
+    /// it is found by the next asking, with a higher number still.
+    #[test]
+    fn writes_now_sees_what_the_standing_asking_does_not() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                8 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        // The upper half: the journal keeps what it learns of these pages,
+        // and the other tests' allocations often begin where this one did.
+        let p = base + 4 * PAGE;
+        let (start, end) = (p, p + 4 * PAGE);
+        let page = p / PAGE + 1;
+        let at = |w: &[(usize, u64)]| w.iter().find(|e| e.0 == page).map(|e| e.1);
+        writes(start, end, false).expect("watched");
+        ask_once(&[(start, start + 2 * PAGE), (start + 2 * PAGE, end)]);
+        let (standing, before) = writes(start, end, false).expect("watched");
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
+        let (same, unseen) = writes(start, end, false).expect("watched");
+        assert_eq!(same, standing);
+        assert_eq!(at(&unseen), at(&before), "the standing asking does not see it");
+        let (now, seen) = writes_now(start, end).expect("watched");
+        assert!(now > standing);
+        assert_eq!(at(&seen), Some(now));
+        // The standing asking's answer holds it now, above its own number.
+        let (same, journal) = writes(start, end, false).expect("watched");
+        assert_eq!((same, at(&journal)), (standing, Some(now)));
+        // Its bit was reset: asked again, it keeps that number.
+        let (again, kept) = writes_now(start, end).expect("watched");
+        assert!(again > now);
+        assert_eq!(at(&kept), Some(now));
+        // SAFETY: as above.
+        unsafe { ((p + PAGE + 9) as *mut u8).write(2) };
+        let (later, found) = writes_now(start, end).expect("watched");
+        assert_eq!(at(&found), Some(later));
+        ask_once_end();
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
