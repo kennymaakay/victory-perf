@@ -122,6 +122,7 @@ pub fn report_crashes() {
         AddVectoredExceptionHandler(0, Some(handler));
         SetUnhandledExceptionFilter(Some(filter));
     }
+    crate::console_insn::start_stats();
 }
 
 /// What the vectored handler reports as it happens.

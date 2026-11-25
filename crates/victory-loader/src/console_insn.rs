@@ -46,6 +46,89 @@ static EMULATED: AtomicU64 = AtomicU64::new(0);
 static ASKED: AtomicU64 = AtomicU64::new(0);
 static ZEROED: AtomicU64 = AtomicU64::new(0);
 
+/// Instructions emulated since the start, by kind ([`kind`] gives the index, [`KIND_NAMES`]
+/// the names). Each one was an exception: on an Intel CPU every `monitorx` / `mwaitx` of the
+/// title's wait loops traps, and only `clwb` is patched away after its first trap, so how many
+/// of each a second the title runs is what this emulation costs it.
+static KINDS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+const KIND_NAMES: [&str; 10] = ["monitorx", "mwaitx", "clzero", "clzero loops", "clwb", "rdpru", "rdpid", "extrq", "insertq", "other"];
+
+fn kind(what: &ConsoleOnly) -> usize {
+    match what {
+        ConsoleOnly::Monitorx => 0,
+        ConsoleOnly::Mwaitx => 1,
+        ConsoleOnly::Clzero => 2,
+        ConsoleOnly::ClzeroLoop { .. } => 3,
+        ConsoleOnly::Clwb => 4,
+        ConsoleOnly::Rdpru => 5,
+        ConsoleOnly::Rdpid(_) => 6,
+        ConsoleOnly::Extrq { .. } => 7,
+        ConsoleOnly::Insertq { .. } => 8,
+        ConsoleOnly::Ud2 => 9,
+    }
+}
+
+/// One line every five seconds while the title runs: the console instructions emulated per
+/// second, by kind, and the processor time of the whole process in that window, user and
+/// kernel (in cores: 1.0 is one logical processor kept busy). Each emulation is a trip into
+/// Windows, so a high kernel share with many `mwaitx` a second says the traps cost the title
+/// real time. `VICTORY_INSN_STATS=0` turns the line off.
+pub(crate) fn start_stats() {
+    if std::env::var_os("VICTORY_INSN_STATS").is_some_and(|v| v == "0") {
+        return;
+    }
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("victory-insn-stats".into()).spawn(|| {
+            const PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+            let mut last = [0u64; 10];
+            let mut times = process_times();
+            loop {
+                std::thread::sleep(PERIOD);
+                let now: [u64; 10] = std::array::from_fn(|i| KINDS[i].load(Relaxed));
+                let next = process_times();
+                let total: u64 = now.iter().zip(&last).map(|(n, l)| n - l).sum();
+                if total > 0 {
+                    let secs = PERIOD.as_secs_f64();
+                    let per: Vec<String> = now
+                        .iter()
+                        .zip(&last)
+                        .zip(KIND_NAMES)
+                        .filter(|((n, l), _)| **n > **l)
+                        .map(|((n, l), name)| format!("{name} {:.0}", (n - l) as f64 / secs))
+                        .collect();
+                    let (user, kernel) = match (times, next) {
+                        (Some((u0, k0)), Some((u1, k1))) => {
+                            // 100 ns units over the window: cores kept busy
+                            let cores = |a: u64, b: u64| (b.saturating_sub(a)) as f64 / (secs * 1e7);
+                            (cores(u0, u1), cores(k0, k1))
+                        }
+                        _ => (f64::NAN, f64::NAN),
+                    };
+                    tracing::info!(
+                        "console CPU instructions emulated per second (each one an exception): {}; the process's processor time: {user:.2} cores in user mode, {kernel:.2} in the kernel",
+                        per.join(", ")
+                    );
+                }
+                last = now;
+                times = next;
+            }
+        });
+    });
+}
+
+/// The process's user and kernel processor time so far, in 100 ns units.
+fn process_times() -> Option<(u64, u64)> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: the pseudo handle of this process and valid out pointers.
+    let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) } != 0;
+    let t = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+    ok.then(|| (t(user), t(kernel)))
+}
+
 fn readable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
     // SAFETY: plain data filled in by the query.
@@ -235,6 +318,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         }
     }
     ctx.Rip += len as u64;
+    KINDS[kind(&what)].fetch_add(1, Relaxed);
     // How often this runs at all (each one is an exception: a trip into Windows and back).
     let emulated = EMULATED.fetch_add(1, Relaxed) + 1;
     if emulated >= 1 << 16 && emulated.is_power_of_two() {
